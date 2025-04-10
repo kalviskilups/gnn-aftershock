@@ -27,7 +27,8 @@ from waveform_gnn import (
     identify_mainshock_and_aftershocks,
     create_aftershock_sequences_with_waveforms,
     WaveformFeatureExtractor,
-    AfterShockGNN
+    AfterShockGNN,
+    consolidate_station_recordings
 )
 
 # Import graph building modules
@@ -44,13 +45,13 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='Waveform-Enhanced Aftershock GNN Training')
     
     # Data parameters
-    parser.add_argument('--time_window', type=int, default=12,
+    parser.add_argument('--time_window', type=int, default=48,
                         help='Time window for connecting events (hours)')
-    parser.add_argument('--distance_threshold', type=int, default=25,
+    parser.add_argument('--distance_threshold', type=int, default=50,
                         help='Distance threshold for connections (km)')
-    parser.add_argument('--sequence_length', type=int, default=10,
+    parser.add_argument('--sequence_length', type=int, default=5,
                         help='Number of events in each sequence')
-    parser.add_argument('--max_waveforms', type=int, default=3000,
+    parser.add_argument('--max_waveforms', type=int, default=13400,
                         help='Maximum number of waveforms to process')
     
     # Model parameters
@@ -68,7 +69,7 @@ def parse_arguments():
                         help='Learning rate')
     parser.add_argument('--batch_size', type=int, default=32,
                         help='Batch size')
-    parser.add_argument('--patience', type=int, default=50,
+    parser.add_argument('--patience', type=int, default=100,
                         help='Early stopping patience')
     
     # Execution parameters
@@ -103,7 +104,12 @@ def main():
         max_waveforms=args.max_waveforms
     )
     
-    # Step 2: Identify mainshock and aftershocks
+    # After extracting waveform features
+    print(f"Original dataset: {len(metadata)} recordings")
+    metadata, waveform_features_dict = consolidate_station_recordings(metadata, waveform_features_dict)
+    print(f"Consolidated dataset: {len(metadata)} unique events")
+
+    # Then proceed with mainshock identification and sequence creation
     mainshock, aftershocks = identify_mainshock_and_aftershocks(metadata)
     
     # Step 3: Create aftershock sequences with waveform features

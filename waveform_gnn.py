@@ -487,15 +487,15 @@ def identify_mainshock_and_aftershocks(metadata):
     return mainshock, aftershocks
 
 
-def create_aftershock_sequences_with_waveforms(aftershocks, waveform_features_dict, sequence_length=15, time_window_hours=24, max_sequences=5000):
+def create_aftershock_sequences_with_waveforms(aftershocks, waveform_features_dict, sequence_length=5, time_window_hours=72, max_sequences=5000):
     """
-    Create balanced aftershock sequences with waveform features
+    Create aftershock sequences with waveform features using a sliding window approach
     """
     sequences = []
     total_aftershocks = len(aftershocks)
     
     # Check which aftershocks have waveform features
-    aftershocks_with_features = aftershocks[aftershocks.index.isin(waveform_features_dict.keys())]
+    aftershocks_with_features = aftershocks[aftershocks['event_id'].isin(waveform_features_dict.keys())]
     
     print(f"Total aftershocks: {total_aftershocks}")
     print(f"Aftershocks with waveform features: {len(aftershocks_with_features)}")
@@ -508,99 +508,132 @@ def create_aftershock_sequences_with_waveforms(aftershocks, waveform_features_di
     # Sort aftershocks by time
     aftershocks_sorted = aftershocks_with_features.sort_values('hours_since_mainshock')
     
-    # Sample sequences from different time periods
-    # This ensures we have sequences from early, middle, and late in the aftershock sequence
-    time_periods = [
-        (0, 24),       # First day
-        (24, 72),      # Days 2-3
-        (72, 7*24),    # Days 4-7
-        (7*24, 30*24)  # Weeks 2-4
-    ]
+    # Use a sliding window approach with a smaller step size
+    step_size = 1  # Create a sequence starting at each event
     
-    for start_hour, end_hour in time_periods:
-        period_shocks = aftershocks_sorted[
-            (aftershocks_sorted['hours_since_mainshock'] >= start_hour) &
-            (aftershocks_sorted['hours_since_mainshock'] < end_hour)
-        ]
+    for i in range(0, len(aftershocks_sorted) - sequence_length, step_size):
+        # Get sequence of aftershocks
+        current_sequence = aftershocks_sorted.iloc[i:i+sequence_length]
+        target_aftershock = aftershocks_sorted.iloc[i+sequence_length]
         
-        if len(period_shocks) < sequence_length + 1:
-            print(f"Not enough aftershocks in period {start_hour}-{end_hour} hours")
+        # Check if the sequence spans less than the time window
+        seq_duration = current_sequence.iloc[-1]['hours_since_mainshock'] - current_sequence.iloc[0]['hours_since_mainshock']
+        if seq_duration > time_window_hours:
             continue
             
-        # Create sequences with a sliding window, but skip some to reduce redundancy
-        step_size = max(1, min(5, len(period_shocks) // 200))  # Adaptive step size
+        # Check for sufficient spatial variation (with reduced threshold)
+        lats = current_sequence['source_latitude_deg'].values
+        lons = current_sequence['source_longitude_deg'].values
         
-        for i in range(0, len(period_shocks) - sequence_length, step_size):
-            # Get sequence of aftershocks
-            current_sequence = period_shocks.iloc[i:i+sequence_length]
-            target_aftershock = period_shocks.iloc[i+sequence_length]
-            
-            # Check if the sequence spans less than the time window
-            seq_duration = current_sequence.iloc[-1]['hours_since_mainshock'] - current_sequence.iloc[0]['hours_since_mainshock']
-            if seq_duration > time_window_hours:
-                continue
+        lat_range = np.max(lats) - np.min(lats)
+        lon_range = np.max(lons) - np.min(lons)
+        
+        # Reduced minimum variation threshold
+        min_variation = 0.02  # ~2 km at this latitude
+        if lat_range < min_variation and lon_range < min_variation:
+            continue
+        
+        # Extract metadata features for each aftershock in the sequence
+        metadata_features = current_sequence[[
+            'source_latitude_deg', 
+            'source_longitude_deg', 
+            'source_depth_km', 
+            'hours_since_mainshock'
+        ]].values
+        
+        # Extract waveform features for each aftershock in the sequence
+        sequence_waveform_features = []
+        valid_sequence = True
+        
+        for _, row in current_sequence.iterrows():
+            event_id = row['event_id']  # Use event_id instead of index
+            if event_id in waveform_features_dict:
+                features = waveform_features_dict[event_id]
                 
-            # Check for sufficient spatial variation
-            lats = current_sequence['source_latitude_deg'].values
-            lons = current_sequence['source_longitude_deg'].values
-            
-            lat_range = np.max(lats) - np.min(lats)
-            lon_range = np.max(lons) - np.min(lons)
-            
-            # Skip sequences with very little spatial variation
-            min_variation = 0.05  # ~5 km at this latitude
-            if lat_range < min_variation and lon_range < min_variation:
-                continue
-            
-            # Extract metadata features for each aftershock in the sequence
-            metadata_features = current_sequence[[
-                'source_latitude_deg', 
-                'source_longitude_deg', 
-                'source_depth_km', 
-                'hours_since_mainshock'
-            ]].values
-            
-            # Extract waveform features for each aftershock in the sequence
-            sequence_waveform_features = []
-            valid_sequence = True
-            
-            for idx in current_sequence.index:
-                if idx in waveform_features_dict:
-                    features = waveform_features_dict[idx]
-                    
-                    # Check if we have valid features
-                    if features and len(features) > 0:
-                        sequence_waveform_features.append(features)
-                    else:
-                        valid_sequence = False
-                        break
+                # Check if we have valid features
+                if features and len(features) > 0:
+                    sequence_waveform_features.append(features)
                 else:
                     valid_sequence = False
                     break
-            
-            # Skip if any event in the sequence doesn't have valid waveform features
-            if not valid_sequence:
-                continue
-            
-            # Target is the location of the next aftershock
-            target = np.array([
-                target_aftershock['source_latitude_deg'],
-                target_aftershock['source_longitude_deg']
-            ])
-            
-            sequences.append((metadata_features, sequence_waveform_features, target))
-            
-            # Limit the number of sequences to avoid memory issues
-            if len(sequences) >= max_sequences:
-                print(f"Reached maximum number of sequences ({max_sequences})")
+            else:
+                valid_sequence = False
                 break
+        
+        # Skip if any event in the sequence doesn't have valid waveform features
+        if not valid_sequence:
+            continue
+        
+        # Target is the location of the next aftershock
+        target = np.array([
+            target_aftershock['source_latitude_deg'],
+            target_aftershock['source_longitude_deg']
+        ])
+        
+        sequences.append((metadata_features, sequence_waveform_features, target))
         
         # Limit the number of sequences to avoid memory issues
         if len(sequences) >= max_sequences:
+            print(f"Reached maximum number of sequences ({max_sequences})")
             break
     
     print(f"Created {len(sequences)} aftershock sequences with waveform features")
     return sequences
+
+
+def consolidate_station_recordings(metadata, waveform_features_dict):
+    """
+    Consolidate multiple station recordings of the same event into a single representation
+    """
+    # Create event IDs based on source parameters
+    metadata['lat_rounded'] = np.round(metadata['source_latitude_deg'], 4)
+    metadata['lon_rounded'] = np.round(metadata['source_longitude_deg'], 4)
+    metadata['depth_rounded'] = np.round(metadata['source_depth_km'], 1)
+    
+    metadata['event_id'] = metadata.groupby(['source_origin_time', 
+                                            'lat_rounded',
+                                            'lon_rounded',
+                                            'depth_rounded']).ngroup()
+    
+    print(f"Original recordings: {len(metadata)}, Unique events: {metadata['event_id'].nunique()}")
+    
+    # Create consolidated representations
+    consolidated_metadata = []
+    consolidated_features = {}
+    
+    # Track how many events actually have features
+    events_with_features = 0
+    
+    for event_id, group in metadata.groupby('event_id'):
+        # Find recordings with valid waveform features
+        valid_recordings = []
+        for idx in group.index:
+            if idx in waveform_features_dict and waveform_features_dict[idx]:
+                valid_recordings.append(idx)
+        
+        # If we have recordings with features, use one of them
+        if valid_recordings:
+            best_idx = valid_recordings[0]  # Just take the first valid one
+            events_with_features += 1
+        else:
+            # If no recording has features, just take the first index
+            best_idx = group.index[0]
+        
+        # Take metadata from best recording
+        best_record = group.loc[best_idx].copy()
+        best_record['station_count'] = len(group)
+        best_record['event_id'] = event_id  # Keep event_id in the metadata
+        consolidated_metadata.append(best_record)
+        
+        # Map waveform features to the event_id
+        if best_idx in waveform_features_dict and waveform_features_dict[best_idx]:
+            consolidated_features[event_id] = waveform_features_dict[best_idx]
+    
+    print(f"Events with valid waveform features: {events_with_features}")
+    
+    # Convert to DataFrame
+    consolidated_metadata = pd.DataFrame(consolidated_metadata)
+    return consolidated_metadata, consolidated_features
 
 
 def build_graphs_from_sequences_with_waveforms(sequences, distance_threshold_km=25):
@@ -712,26 +745,12 @@ def build_graphs_from_sequences_with_waveforms(sequences, distance_threshold_km=
 
 
 def normalize_waveform_features(graph_dataset, feature_names):
-    """
-    Normalize waveform features across the dataset
-    
-    Parameters:
-    -----------
-    graph_dataset : list
-        List of PyTorch Geometric Data objects
-    feature_names : list
-        List of feature names for the waveform features
-        
-    Returns:
-    --------
-    normalized_dataset : list
-        List of PyTorch Geometric Data objects with normalized features
-    """
+    """Enhanced normalization with robust scaling and outlier handling"""
     import torch
     import numpy as np
-    from sklearn.preprocessing import StandardScaler
+    from sklearn.preprocessing import RobustScaler
     
-    # Extract all waveform features for normalization
+    # Extract all waveform features
     all_waveform_features = []
     for graph in graph_dataset:
         all_waveform_features.append(graph.waveform.numpy())
@@ -739,14 +758,25 @@ def normalize_waveform_features(graph_dataset, feature_names):
     if not all_waveform_features:
         return graph_dataset
     
-    # Reshape to 2D array for scaling
+    # Reshape to 2D array
     stacked_features = np.vstack(all_waveform_features)
     
-    # Initialize scaler
-    scaler = StandardScaler()
+    # Check for NaN or infinite values
+    invalid_mask = np.isnan(stacked_features) | np.isinf(stacked_features)
+    if invalid_mask.any():
+        print(f"WARNING: Found {np.sum(invalid_mask)} invalid values in features. Replacing with zeros.")
+        stacked_features[invalid_mask] = 0
+    
+    # Use RobustScaler instead of StandardScaler to handle outliers better
+    scaler = RobustScaler()
     
     # Fit scaler and transform features
     normalized_features = scaler.fit_transform(stacked_features)
+    
+    # Print feature statistics to diagnose issues
+    print(f"Feature min values: {np.min(normalized_features, axis=0)[:5]}...")
+    print(f"Feature max values: {np.max(normalized_features, axis=0)[:5]}...")
+    print(f"Feature median values: {np.median(normalized_features, axis=0)[:5]}...")
     
     # Replace features in the dataset
     start_idx = 0
@@ -931,18 +961,18 @@ def train_waveform_gnn_model(graph_dataset, model, epochs=200, lr=0.001, batch_s
         if (epoch + 1) % 10 == 0:
             print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
         
-        # Early stopping
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
+        # # Early stopping
+        # if val_loss < best_val_loss:
+        #     best_val_loss = val_loss
+        #     patience_counter = 0
             
-            # Save the best model
-            torch.save(model.state_dict(), 'results/waveform_gnn_model.pt')
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch+1}")
-                break
+        #     # Save the best model
+        #     torch.save(model.state_dict(), 'results/waveform_gnn_model.pt')
+        # else:
+        #     patience_counter += 1
+        #     if patience_counter >= patience:
+        #         print(f"Early stopping at epoch {epoch+1}")
+        #         break
     
     # Load the best model
     try:
@@ -1018,11 +1048,25 @@ def evaluate_waveform_model(model, graph_dataset, mainshock):
             # Forward pass
             lat_pred, lon_pred = model(batch.metadata, batch.waveform, batch.edge_index, batch.batch)
             
-            # Store predictions and actual values
+            # Fix the dimensionality issue
+            lat_np = lat_pred.cpu().numpy()
+            lon_np = lon_pred.cpu().numpy()
+            
+            # Handle scalar case (when batch size is 1)
+            if lat_np.ndim == 0 or (lat_np.ndim == 2 and lat_np.shape[0] == 1 and lat_np.shape[1] == 1):
+                lat_np = np.array([float(lat_np)])
+            else:
+                lat_np = lat_np.squeeze()
+                
+            if lon_np.ndim == 0 or (lon_np.ndim == 2 and lon_np.shape[0] == 1 and lon_np.shape[1] == 1):
+                lon_np = np.array([float(lon_np)])
+            else:
+                lon_np = lon_np.squeeze()
+            
             actual_lats.extend(batch.y[:, 0].cpu().numpy())
             actual_lons.extend(batch.y[:, 1].cpu().numpy())
-            pred_lats.extend(lat_pred.squeeze().cpu().numpy())
-            pred_lons.extend(lon_pred.squeeze().cpu().numpy())
+            pred_lats.extend(lat_np)
+            pred_lons.extend(lon_np)
     
     # Calculate error in kilometers
     errors_km = []
