@@ -115,3 +115,139 @@ class SimplifiedAfterShockGNN(torch.nn.Module):
         lon = self.lon_predictor(x_graph)
 
         return lat, lon
+    
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv, global_mean_pool, global_max_pool
+
+class SimplerAfterShockGNN(torch.nn.Module):
+    """
+    Simplified Graph Neural Network for aftershock prediction
+    with better optimization properties
+    """
+    def __init__(self, metadata_channels, waveform_channels, hidden_channels=64, dropout=0.3):
+        super(SimplerAfterShockGNN, self).__init__()
+        
+        self.dropout = dropout
+        
+        # Simplified encoders
+        self.metadata_encoder = nn.Sequential(
+            nn.Linear(metadata_channels, hidden_channels),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        self.waveform_encoder = nn.Sequential(
+            nn.Linear(waveform_channels, hidden_channels),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        # Feature combiner - simpler
+        self.feature_combiner = nn.Sequential(
+            nn.Linear(hidden_channels * 2, hidden_channels),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        # Use GCN instead of GAT - simpler and more stable
+        self.conv1 = GCNConv(hidden_channels, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, hidden_channels)
+        
+        # Add skip connections and batch norms for stability
+        self.batch_norm1 = nn.BatchNorm1d(hidden_channels)
+        self.batch_norm2 = nn.BatchNorm1d(hidden_channels)
+        
+        # Use both mean and max pooling for better feature extraction
+        self.lat_predictor = nn.Sequential(
+            nn.Linear(hidden_channels * 2, hidden_channels),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels, 1)
+        )
+        
+        self.lon_predictor = nn.Sequential(
+            nn.Linear(hidden_channels * 2, hidden_channels),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels, 1)
+        )
+        
+    def forward(self, metadata, waveform_features, edge_index, batch):
+        """
+        Forward pass with simplified architecture
+        """
+        # Encode metadata features
+        metadata_encoded = self.metadata_encoder(metadata)
+        
+        # Encode waveform features
+        waveform_encoded = self.waveform_encoder(waveform_features)
+        
+        # Combine features
+        x = torch.cat([metadata_encoded, waveform_encoded], dim=1)
+        x = self.feature_combiner(x)
+        
+        # First graph convolution with residual connection
+        x1 = F.relu(self.batch_norm1(self.conv1(x, edge_index)))
+        x1 = F.dropout(x1, p=self.dropout, training=self.training)
+        
+        # Second graph convolution with skip connection from first
+        x2 = self.conv2(x1, edge_index)
+        x2 = self.batch_norm2(x2 + x1)  # Residual connection
+        x2 = F.relu(x2)
+        x2 = F.dropout(x2, p=self.dropout, training=self.training)
+        
+        # Use both mean and max pooling for better features
+        x_mean = global_mean_pool(x2, batch)
+        x_max = global_max_pool(x2, batch)
+        
+        # Combine pooling methods
+        x_combined = torch.cat([x_mean, x_max], dim=1)
+        
+        # Predict latitude and longitude
+        lat = self.lat_predictor(x_combined)
+        lon = self.lon_predictor(x_combined)
+        
+        return lat, lon
+
+
+class BaselineRegressor(torch.nn.Module):
+    """
+    Even simpler baseline model that doesn't use graph structure
+    to verify that learning is happening
+    """
+    def __init__(self, metadata_channels, waveform_channels, hidden_channels=64, dropout=0.3):
+        super(BaselineRegressor, self).__init__()
+        
+        # Combined network for both metadata and waveform features
+        self.network = nn.Sequential(
+            nn.Linear(metadata_channels + waveform_channels, hidden_channels),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        # Separate output heads
+        self.lat_head = nn.Linear(hidden_channels, 1)
+        self.lon_head = nn.Linear(hidden_channels, 1)
+        
+    def forward(self, metadata, waveform_features, edge_index, batch):
+        # Concatenate features - ignore edge_index
+        x = torch.cat([metadata, waveform_features], dim=1)
+        
+        # Apply network
+        x = self.network(x)
+        
+        # Apply pooling
+        x = global_mean_pool(x, batch)
+        
+        # Get predictions
+        lat = self.lat_head(x)
+        lon = self.lon_head(x)
+        
+        return lat, lon

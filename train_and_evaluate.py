@@ -8,10 +8,21 @@ from torch_geometric.loader import DataLoader
 import torch.nn.functional as F
 
 
-def train_model(graph_dataset, model, epochs=200, lr=0.001, batch_size=32, patience=15):
+def train_model_with_diagnostics(
+    graph_dataset, model, epochs=200, lr=0.001, batch_size=32, patience=15
+):
     """
-    Train the simplified GNN model using the graph dataset
+    Improved training function with diagnostics to monitor learning progress
     """
+    import os
+    import torch
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from sklearn.model_selection import train_test_split
+    from torch_geometric.loader import DataLoader
+    import torch.nn.functional as F
+
     # Create results directory if it doesn't exist
     os.makedirs("results", exist_ok=True)
 
@@ -38,33 +49,52 @@ def train_model(graph_dataset, model, epochs=200, lr=0.001, batch_size=32, patie
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
-    # Optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    # ===== IMPROVED OPTIMIZER =====
+    # Use AdamW for better weight decay handling
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
-    # Add learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=patience // 3, verbose=True
+    # ===== IMPROVED LEARNING RATE SCHEDULER =====
+    # Use OneCycleLR for better convergence
+    from torch.optim.lr_scheduler import OneCycleLR
+
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        epochs=epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.3,  # Warm up for 30% of training
+        div_factor=25.0,  # Initial LR = max_lr/25
+        final_div_factor=10000.0,  # Final LR = max_lr/10000
     )
 
-    # Custom loss function that considers both point accuracy and distribution
-    def spatial_distribution_loss(pred, target, distribution_weight=0.3):
-        # Use mean absolute error instead of MSE for more stable gradients
-        point_loss = F.l1_loss(pred, target)
-        
+    # ===== IMPROVED LOSS FUNCTION =====
+    def scaled_loss_function(pred, target, distribution_weight=0.3):
+        """Loss function with proper scaling and L1 component"""
+        # Scale down values for numerical stability
+        scaled_pred = pred / 10.0  # Scale to tens of km
+        scaled_target = target / 10.0
+
+        # Combine L1 and L2 loss for better stability
+        l1_loss = F.l1_loss(scaled_pred, scaled_target)
+        l2_loss = F.mse_loss(scaled_pred, scaled_target)
+        point_loss = 0.5 * l1_loss + 0.5 * l2_loss
+
         # Skip distribution component if batch size is too small
         if pred.size(0) <= 1:
             return point_loss
-        
+
         # Distribution preservation with scaling
-        pred_var = torch.var(pred, dim=0)
-        target_var = torch.var(pred, dim=0)
-        
-        # Use L1 loss for variance differences too
+        pred_var = torch.var(scaled_pred, dim=0)
+        target_var = torch.var(scaled_target, dim=0)
+
+        # L1 loss for variance to avoid quadratic scaling
         variance_loss = F.l1_loss(pred_var, target_var)
-        
+
         # Combine losses
-        total_loss = (1 - distribution_weight) * point_loss + distribution_weight * variance_loss
-        
+        total_loss = (
+            1 - distribution_weight
+        ) * point_loss + distribution_weight * variance_loss
+
         return total_loss
 
     # For early stopping
@@ -75,13 +105,32 @@ def train_model(graph_dataset, model, epochs=200, lr=0.001, batch_size=32, patie
     train_losses = []
     val_losses = []
 
+    # For monitoring predictions
+    all_predictions = []
+
+    # ===== DIAGNOSTIC FUNCTION =====
+    def print_tensor_stats(prefix, tensor):
+        """Print statistics about a tensor for diagnostics"""
+        if tensor is not None:
+            stats = {
+                "mean": tensor.mean().item(),
+                "std": tensor.std().item() if tensor.numel() > 1 else 0,
+                "min": tensor.min().item(),
+                "max": tensor.max().item(),
+                "shape": tensor.shape,
+            }
+            print(f"{prefix}: {stats}")
+
     # Training loop
     for epoch in range(epochs):
         # Training
         model.train()
         train_loss = 0.0
 
-        for batch in train_loader:
+        # Keep track of prediction changes
+        epoch_predictions = []
+
+        for batch_idx, batch in enumerate(train_loader):
             batch = batch.to(device)
             optimizer.zero_grad()
 
@@ -94,22 +143,50 @@ def train_model(graph_dataset, model, epochs=200, lr=0.001, batch_size=32, patie
                 # Combine predictions
                 pred = torch.cat([lat_pred, lon_pred], dim=1)
 
+                # Save first batch predictions to monitor learning
+                if batch_idx == 0:
+                    epoch_predictions = pred.detach().cpu().numpy()
+
+                # Print diagnostics every 50 epochs for the first batch
+                if epoch % 50 == 0 and batch_idx == 0:
+                    print(f"\nEpoch {epoch} diagnostics:")
+                    print_tensor_stats("Predictions", pred)
+                    print_tensor_stats("Targets", batch.y)
+
+                    # Check gradients before backprop to see if they're flowing
+                    pred_mean = pred.mean()
+                    dummy_loss = (
+                        pred_mean  # Compute a simple loss to check gradient flow
+                    )
+                    dummy_loss.backward(
+                        retain_graph=True
+                    )  # retain_graph=True keeps the computational graph
+
+                    # Check if gradients are flowing to inputs
+                    grad_norms = []
+                    for name, param in model.named_parameters():
+                        if param.grad is not None:
+                            grad_norm = param.grad.norm().item()
+                            grad_norms.append(grad_norm)
+
+                    optimizer.zero_grad()  # Clear the dummy gradients
+
+                    print(
+                        f"Gradient stats - mean: {np.mean(grad_norms):.6f}, max: {np.max(grad_norms):.6f}, min: {np.min(grad_norms):.6f}"
+                    )
+
                 # Compute loss with distribution preservation
-                loss = spatial_distribution_loss(pred, batch.y)
+                loss = scaled_loss_function(pred, batch.y)
 
                 # Backward pass
                 loss.backward()
 
-                if epoch % 10 == 0:
-                    with torch.no_grad():
-                        sample_batch = next(iter(train_loader))
-                        sample_pred = model(sample_batch.metadata, sample_batch.waveform, sample_batch.edge_index, sample_batch.batch)
-                        print(f"Sample prediction at epoch {epoch}:", sample_pred[:5])
-
-                # Gradient clipping for stability
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                # ===== IMPROVED GRADIENT CLIPPING =====
+                # Use a more appropriate clipping value
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
 
                 optimizer.step()
+                scheduler.step()  # Step LR scheduler every batch
 
                 train_loss += loss.item() * batch.num_graphs
 
@@ -120,6 +197,9 @@ def train_model(graph_dataset, model, epochs=200, lr=0.001, batch_size=32, patie
 
         train_loss /= len(train_data)
         train_losses.append(train_loss)
+
+        # Store predictions to track changes
+        all_predictions.append(epoch_predictions)
 
         # Validation
         model.eval()
@@ -139,7 +219,7 @@ def train_model(graph_dataset, model, epochs=200, lr=0.001, batch_size=32, patie
                     pred = torch.cat([lat_pred, lon_pred], dim=1)
 
                     # Compute loss
-                    loss = spatial_distribution_loss(pred, batch.y)
+                    loss = scaled_loss_function(pred, batch.y)
 
                     val_loss += loss.item() * batch.num_graphs
 
@@ -151,13 +231,10 @@ def train_model(graph_dataset, model, epochs=200, lr=0.001, batch_size=32, patie
         val_loss /= len(val_data)
         val_losses.append(val_loss)
 
-        # Update learning rate
-        scheduler.step(val_loss)
-
         # Print progress
         if (epoch + 1) % 10 == 0:
             print(
-                f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}"
+                f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}"
             )
 
         # Early stopping
@@ -190,6 +267,41 @@ def train_model(graph_dataset, model, epochs=200, lr=0.001, batch_size=32, patie
     plt.grid(True, alpha=0.3)
     plt.savefig("results/simplified_training_history.png")
     plt.close()
+
+    # ===== PREDICTION EVOLUTION ANALYSIS =====
+    # Check if we have at least 3 epochs of predictions for analysis
+    if len(all_predictions) >= 3:
+        # Plot how predictions evolved over training
+        plt.figure(figsize=(12, 8))
+        colors = ["r", "g", "b", "c", "m", "y", "k"]
+
+        # Plot predictions from selected epochs
+        epochs_to_plot = [
+            0,
+            len(all_predictions) // 4,
+            len(all_predictions) // 2,
+            len(all_predictions) - 1,
+        ]
+        for i, epoch_idx in enumerate(epochs_to_plot):
+            if epoch_idx < len(all_predictions) and len(all_predictions[epoch_idx]) > 0:
+                epoch_preds = all_predictions[epoch_idx]
+                plt.scatter(
+                    epoch_preds[:, 1],  # Longitude predictions
+                    epoch_preds[:, 0],  # Latitude predictions
+                    color=colors[i % len(colors)],
+                    marker="o",
+                    s=50,
+                    alpha=0.6,
+                    label=f"Epoch {epoch_idx}",
+                )
+
+        plt.title("Evolution of Predictions During Training")
+        plt.xlabel("Predicted Longitude Offset (km)")
+        plt.ylabel("Predicted Latitude Offset (km)")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.savefig("results/prediction_evolution.png")
+        plt.close()
 
     return model, train_losses, val_losses
 

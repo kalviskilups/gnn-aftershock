@@ -1,6 +1,5 @@
 """
-Simplified Aftershock Prediction Pipeline with relative position targets
-Fixed version to properly handle data matching issues
+Modified Aftershock Prediction Pipeline with improved training approach
 """
 
 import os
@@ -15,11 +14,11 @@ from torch_geometric.loader import DataLoader
 import torch.nn.functional as F
 
 
-# Parse arguments with reduced default sequence length and added debugging options
+# Parse arguments with added options for improved training
 def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description="Simplified Aftershock GNN with Relative Position Prediction"
+        description="Improved Aftershock GNN with Better Training"
     )
 
     # Data parameters
@@ -32,13 +31,13 @@ def parse_arguments():
     parser.add_argument(
         "--distance_threshold",
         type=int,
-        default=40,
+        default=25,
         help="Distance threshold for connections (km)",
     )
     parser.add_argument(
         "--sequence_length",
         type=int,
-        default=5,  # Reduced default sequence length
+        default=5,
         help="Number of events in each sequence",
     )
     parser.add_argument(
@@ -53,18 +52,27 @@ def parse_arguments():
         "--hidden_channels", type=int, default=64, help="Size of hidden layers"
     )
     parser.add_argument(
-        "--num_layers", type=int, default=3, help="Number of GNN layers"
+        "--model_type",
+        type=str,
+        default="gcn",
+        choices=["gat", "gcn", "baseline"],
+        help="Type of model to use (gat, gcn, baseline)",
     )
-    parser.add_argument("--dropout", type=float, default=0.5, help="Dropout rate")
+    parser.add_argument("--dropout", type=float, default=0.3, help="Dropout rate")
 
     # Training parameters
     parser.add_argument(
         "--epochs", type=int, default=300, help="Maximum training epochs"
     )
-    parser.add_argument("--lr", type=float, default=0.0005, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=0.005, help="Learning rate")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument(
-        "--patience", type=int, default=100, help="Early stopping patience"
+        "--patience", type=int, default=15, help="Early stopping patience"
+    )
+    parser.add_argument(
+        "--scale_targets",
+        action="store_true",
+        help="Scale target values (divide by 10)",
     )
 
     # Execution parameters
@@ -76,7 +84,7 @@ def parse_arguments():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="results/simplified_aftershock_model.pt",
+        default="results/improved_aftershock_model.pt",
         help="Path to save/load model",
     )
     parser.add_argument(
@@ -86,6 +94,166 @@ def parse_arguments():
     )
 
     return parser.parse_args()
+
+
+def prepare_sequences_with_relative_targets(
+    aftershocks,
+    waveform_features_dict,
+    sequence_length=5,
+    time_window_hours=72,
+    max_sequences=5000,
+    scale_targets=False,
+):
+    """
+    Create aftershock sequences with waveform features using relative targets
+    with optional scaling
+    """
+    import numpy as np
+    import pandas as pd
+
+    sequences = []
+    total_aftershocks = len(aftershocks)
+
+    # Print keys to debug matching
+    print(
+        f"First few waveform_features_dict keys: {list(waveform_features_dict.keys())[:5]}"
+    )
+    print(f"First few aftershocks indices: {list(aftershocks.index)[:5]}")
+
+    # Check if aftershocks have 'event_id' column
+    if "event_id" in aftershocks.columns:
+        print("Using 'event_id' column to match aftershocks with waveform features")
+        # Check which aftershocks have waveform features using event_id
+        aftershocks_with_features = aftershocks[
+            aftershocks["event_id"].isin(waveform_features_dict.keys())
+        ]
+    else:
+        print("Using index to match aftershocks with waveform features")
+        # Check which aftershocks have waveform features using index
+        aftershocks_with_features = aftershocks[
+            aftershocks.index.isin(waveform_features_dict.keys())
+        ]
+
+    print(f"Total aftershocks: {total_aftershocks}")
+    print(f"Aftershocks with waveform features: {len(aftershocks_with_features)}")
+
+    # Adjust sequence length if needed
+    if len(aftershocks_with_features) < sequence_length + 1:
+        original_sequence_length = sequence_length
+        sequence_length = min(5, len(aftershocks_with_features) - 1)
+        if sequence_length <= 0:
+            print(f"Not enough aftershocks with waveform features to create sequences")
+            return []
+
+        print(
+            f"Adjusting sequence length from {original_sequence_length} to {sequence_length} due to limited data"
+        )
+
+    # Sort aftershocks by time
+    aftershocks_sorted = aftershocks_with_features.sort_values("hours_since_mainshock")
+
+    # Use a sliding window approach
+    step_size = 1
+
+    for i in range(0, len(aftershocks_sorted) - sequence_length, step_size):
+        # Get sequence of aftershocks
+        current_sequence = aftershocks_sorted.iloc[i : i + sequence_length]
+        target_aftershock = aftershocks_sorted.iloc[i + sequence_length]
+
+        # Check if the sequence spans less than the time window
+        seq_duration = (
+            current_sequence.iloc[-1]["hours_since_mainshock"]
+            - current_sequence.iloc[0]["hours_since_mainshock"]
+        )
+        if seq_duration > time_window_hours:
+            continue
+
+        # Extract metadata features for each aftershock in the sequence
+        metadata_features = current_sequence[
+            [
+                "source_latitude_deg",
+                "source_longitude_deg",
+                "source_depth_km",
+                "hours_since_mainshock",
+            ]
+        ].values
+
+        # Extract waveform features for each aftershock in the sequence
+        sequence_waveform_features = []
+        valid_sequence = True
+
+        for idx, row in current_sequence.iterrows():
+            # Try using event_id if available, otherwise use index
+            if "event_id" in current_sequence.columns:
+                feature_key = row["event_id"]
+            else:
+                feature_key = idx
+
+            if feature_key in waveform_features_dict:
+                features = waveform_features_dict[feature_key]
+
+                # Check if we have valid features
+                if features and len(features) > 0:
+                    sequence_waveform_features.append(features)
+                else:
+                    valid_sequence = False
+                    break
+            else:
+                valid_sequence = False
+                break
+
+        # Skip if any event in the sequence doesn't have valid waveform features
+        if not valid_sequence:
+            continue
+
+        # Use relative target (delta from last event in sequence)
+        last_event_lat = current_sequence.iloc[-1]["source_latitude_deg"]
+        last_event_lon = current_sequence.iloc[-1]["source_longitude_deg"]
+
+        target_lat = target_aftershock["source_latitude_deg"]
+        target_lon = target_aftershock["source_longitude_deg"]
+
+        # Convert to kilometers for more numerically stable targets
+        # Approximate conversion at these latitudes
+        lat_km_per_degree = 111.0  # Approximate km per degree latitude
+        lon_km_per_degree = 111.0 * np.cos(
+            np.radians(last_event_lat)
+        )  # Varies with latitude
+
+        delta_lat_km = (target_lat - last_event_lat) * lat_km_per_degree
+        delta_lon_km = (target_lon - last_event_lon) * lon_km_per_degree
+
+        # Scale targets if requested (helps with training stability)
+        if scale_targets:
+            delta_lat_km = delta_lat_km / 10.0  # Scale to tens of km
+            delta_lon_km = delta_lon_km / 10.0
+
+        # Store as relative target
+        target = np.array([delta_lat_km, delta_lon_km])
+
+        # Also store reference coordinates for conversion back to absolute
+        reference = np.array([last_event_lat, last_event_lon])
+
+        # Store scale factor if we scaled targets
+        scale_factor = 10.0 if scale_targets else 1.0
+
+        sequences.append(
+            (
+                metadata_features,
+                sequence_waveform_features,
+                target,
+                reference,
+                scale_factor,
+            )
+        )
+
+        # Limit the number of sequences
+        if len(sequences) >= max_sequences:
+            print(f"Reached maximum number of sequences ({max_sequences})")
+            break
+
+    print(f"Created {len(sequences)} aftershock sequences with relative targets")
+    return sequences
 
 
 def build_graphs_from_sequences(sequences, distance_threshold_km=25, debug=False):
@@ -98,6 +266,7 @@ def build_graphs_from_sequences(sequences, distance_threshold_km=25, debug=False
 
     graph_dataset = []
     reference_coords = []
+    scale_factors = []
 
     # Extract waveform feature names from the first sequence
     if len(sequences) > 0:
@@ -106,13 +275,14 @@ def build_graphs_from_sequences(sequences, distance_threshold_km=25, debug=False
         print(f"Using {len(feature_names)} waveform features: {feature_names[:5]}...")
     else:
         feature_names = []
-        return graph_dataset, feature_names, reference_coords
+        return graph_dataset, feature_names, reference_coords, scale_factors
 
     for seq_idx, (
         metadata_features,
         waveform_features_list,
         target,
         reference,
+        scale_factor,
     ) in enumerate(sequences):
         if debug and seq_idx < 3:
             print(f"\nSequence {seq_idx}:")
@@ -120,6 +290,7 @@ def build_graphs_from_sequences(sequences, distance_threshold_km=25, debug=False
             print(f"  Waveform features: {len(waveform_features_list)} events")
             print(f"  Target: {target}")
             print(f"  Reference: {reference}")
+            print(f"  Scale factor: {scale_factor}")
 
         num_nodes = len(metadata_features)
 
@@ -171,9 +342,7 @@ def build_graphs_from_sequences(sequences, distance_threshold_km=25, debug=False
                 time_diff = abs(time2 - time1)
 
                 # Add edge based on distance and time relationship
-                if (
-                    distance < distance_threshold_km and time_diff < 24
-                ):  # Within distance threshold and 24 hours
+                if distance < distance_threshold_km and time_diff < 24:
                     edge_list.append([i, j])
 
         # If no edges created, add connections to temporal neighbors
@@ -201,14 +370,54 @@ def build_graphs_from_sequences(sequences, distance_threshold_km=25, debug=False
 
         graph_dataset.append(graph)
         reference_coords.append(reference)
+        scale_factors.append(scale_factor)
 
     reference_coords = np.array(reference_coords)
+    scale_factors = np.array(scale_factors)
+
     print(f"Built {len(graph_dataset)} graph representations with relative targets")
-    return graph_dataset, feature_names, reference_coords
+    return graph_dataset, feature_names, reference_coords, scale_factors
+
+
+def convert_relative_to_absolute_predictions(
+    pred_deltas, references, scale_factors=None
+):
+    """
+    Convert relative predictions (in km) back to absolute coordinates (lat/lon)
+    with support for scaled predictions
+    """
+    absolute_coords = np.zeros_like(references)
+
+    for i in range(len(pred_deltas)):
+        # Get reference point
+        ref_lat = references[i, 0]
+        ref_lon = references[i, 1]
+
+        # Get predicted deltas (in km)
+        delta_lat_km = pred_deltas[i, 0]
+        delta_lon_km = pred_deltas[i, 1]
+
+        # Apply scaling if needed
+        if scale_factors is not None:
+            delta_lat_km = delta_lat_km * scale_factors[i]
+            delta_lon_km = delta_lon_km * scale_factors[i]
+
+        # Convert km back to degrees
+        lat_km_per_degree = 111.0
+        lon_km_per_degree = 111.0 * np.cos(np.radians(ref_lat))
+
+        delta_lat_deg = delta_lat_km / lat_km_per_degree
+        delta_lon_deg = delta_lon_km / lon_km_per_degree
+
+        # Calculate absolute coordinates
+        absolute_coords[i, 0] = ref_lat + delta_lat_deg
+        absolute_coords[i, 1] = ref_lon + delta_lon_deg
+
+    return absolute_coords
 
 
 def main():
-    """Main execution function for the simplified aftershock prediction"""
+    """Main execution function for the improved aftershock prediction"""
     # Parse arguments
     args = parse_arguments()
 
@@ -221,7 +430,7 @@ def main():
 
     # Record start time
     start_time = datetime.now()
-    print(f"Starting Simplified Aftershock GNN at {start_time}")
+    print(f"Starting Improved Aftershock GNN at {start_time}")
 
     # Step 1: Load and preprocess data with waveforms
     print("\n=== Loading and Preprocessing Data with Waveforms ===")
@@ -234,12 +443,25 @@ def main():
         normalize_waveform_features,
     )
 
-    # Import the simplified model
-    from enhanced_model import SimplifiedAfterShockGNN
+    # Import the appropriate model based on user choice
+    if args.model_type == "gcn":
+        from enhanced_model import SimplerAfterShockGNN as ModelClass
 
-    # Import the fixed sequence preparation function
-    from relative_prediction import prepare_sequences_with_relative_targets
+        print("Using GCN-based model architecture")
+    elif args.model_type == "baseline":
+        from enhanced_model import BaselineRegressor as ModelClass
 
+        print("Using baseline regressor model (non-graph)")
+    else:
+        from enhanced_model import SimplifiedAfterShockGNN as ModelClass
+
+        print("Using GAT-based model architecture")
+
+    # Import the training functions
+    from train_and_evaluate import train_model_with_diagnostics
+    from train_and_evaluate import evaluate_model
+
+    # Load and process data
     metadata, iquique, waveform_features_dict = load_aftershock_data_with_waveforms(
         max_waveforms=args.max_waveforms
     )
@@ -254,7 +476,7 @@ def main():
     # Identify mainshock and aftershocks
     mainshock, aftershocks = identify_mainshock_and_aftershocks(metadata)
 
-    # Print the first few keys of waveform_features_dict and aftershocks index for debugging
+    # Print debugging information if requested
     if args.debug:
         print("\nDebugging information:")
         print(
@@ -273,6 +495,7 @@ def main():
         waveform_features_dict,
         sequence_length=args.sequence_length,
         time_window_hours=args.time_window,
+        scale_targets=args.scale_targets,
     )
 
     if not sequences:
@@ -281,37 +504,35 @@ def main():
 
     # Step 3: Build graph representations
     print("\n=== Building Graph Representations ===")
-    graph_dataset, feature_names, reference_coords = build_graphs_from_sequences(
-        sequences, distance_threshold_km=args.distance_threshold, debug=args.debug
+    graph_dataset, feature_names, reference_coords, scale_factors = (
+        build_graphs_from_sequences(
+            sequences, distance_threshold_km=args.distance_threshold, debug=args.debug
+        )
     )
 
     if len(graph_dataset) == 0:
         print("No valid graph representations created. Exiting.")
         return
 
-    # Step 4: Create the simplified GNN model
-    print("\n=== Creating Simplified GNN Model ===")
+    # Step 4: Create the appropriate model
+    print(f"\n=== Creating {args.model_type.upper()} Model ===")
     metadata_channels = 4  # latitude, longitude, depth, hours since mainshock
     waveform_channels = len(feature_names)  # Number of waveform features
 
-    # Create the simplified model
-    model = SimplifiedAfterShockGNN(
+    # Create the model
+    model = ModelClass(
         metadata_channels=metadata_channels,
         waveform_channels=waveform_channels,
         hidden_channels=args.hidden_channels,
-        num_layers=args.num_layers,
         dropout=args.dropout,
     ).to(device)
 
     print(model)
 
-    # Import the train and evaluate functions
-    from train_and_evaluate import train_model, evaluate_model
-
     # Step 5: Train the model (or load from file)
     if not args.skip_training:
-        print("\n=== Training Simplified GNN Model ===")
-        model, train_losses, val_losses = train_model(
+        print("\n=== Training Model with Enhanced Diagnostics ===")
+        model, train_losses, val_losses = train_model_with_diagnostics(
             graph_dataset,
             model,
             epochs=args.epochs,
@@ -339,7 +560,7 @@ def main():
     end_time = datetime.now()
     duration = end_time - start_time
 
-    print("\n=== Simplified Aftershock GNN Execution Summary ===")
+    print("\n=== Improved Aftershock GNN Execution Summary ===")
     print(f"Started at: {start_time}")
     print(f"Completed at: {end_time}")
     print(f"Total duration: {duration}")
@@ -350,9 +571,10 @@ def main():
     print(f"Distance threshold: {args.distance_threshold} km")
 
     print(f"\nModel parameters:")
+    print(f"  - Model type: {args.model_type}")
     print(f"  - Hidden channels: {args.hidden_channels}")
-    print(f"  - Number of layers: {args.num_layers}")
     print(f"  - Dropout rate: {args.dropout}")
+    print(f"  - Target scaling: {'Yes' if args.scale_targets else 'No'}")
 
     print(f"\nPerformance:")
     print(f"  - Mean error: {mean_error:.2f} km")
