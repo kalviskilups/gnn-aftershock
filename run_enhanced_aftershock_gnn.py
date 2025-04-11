@@ -37,7 +37,7 @@ def parse_arguments():
     parser.add_argument(
         "--sequence_length",
         type=int,
-        default=5,
+        default=15,
         help="Number of events in each sequence",
     )
     parser.add_argument(
@@ -445,7 +445,7 @@ def main():
 
     # Import the appropriate model based on user choice
     if args.model_type == "gcn":
-        from enhanced_model import SimplerAfterShockGNN as ModelClass
+        from enhanced_model import SimplifiedAfterShockGNN as ModelClass
 
         print("Using GCN-based model architecture")
     elif args.model_type == "baseline":
@@ -524,6 +524,7 @@ def main():
         metadata_channels=metadata_channels,
         waveform_channels=waveform_channels,
         hidden_channels=args.hidden_channels,
+        num_layers=3,
         dropout=args.dropout,
     ).to(device)
 

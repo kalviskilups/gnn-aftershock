@@ -183,7 +183,7 @@ def train_model_with_diagnostics(
 
                 # ===== IMPROVED GRADIENT CLIPPING =====
                 # Use a more appropriate clipping value
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
                 optimizer.step()
                 scheduler.step()  # Step LR scheduler every batch
@@ -232,7 +232,7 @@ def train_model_with_diagnostics(
         val_losses.append(val_loss)
 
         # Print progress
-        if (epoch + 1) % 10 == 0:
+        if True:
             print(
                 f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}"
             )
