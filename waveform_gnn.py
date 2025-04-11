@@ -225,27 +225,27 @@ class AfterShockGNN(torch.nn.Module):
         
         # Graph Attention layers
         self.gat_layers = nn.ModuleList()
-        self.gat_layers.append(GATConv(hidden_channels, hidden_channels, heads=4, dropout=dropout))
+        self.gat_layers.append(GATConv(hidden_channels, hidden_channels, heads=2, dropout=dropout))
         
         # For subsequent layers, input is hidden_channels * 4 (from 4 attention heads)
         for i in range(1, num_layers):
-            self.gat_layers.append(GATConv(hidden_channels * 4, hidden_channels, heads=4, dropout=dropout))
+            self.gat_layers.append(GATConv(hidden_channels * 2, hidden_channels, heads=2, dropout=dropout))
             
         # Batch normalization layers
         self.batch_norms = nn.ModuleList()
         for i in range(num_layers):
-            self.batch_norms.append(nn.BatchNorm1d(hidden_channels * 4))  # *4 for the 4 attention heads
+            self.batch_norms.append(nn.BatchNorm1d(hidden_channels * 2))  # *4 for the 4 attention heads
             
         # Output layers for predicting latitude and longitude
         self.lat_predictor = nn.Sequential(
-            nn.Linear(hidden_channels * 4, hidden_channels),
+            nn.Linear(hidden_channels * 2, hidden_channels),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_channels, 1)
         )
         
         self.lon_predictor = nn.Sequential(
-            nn.Linear(hidden_channels * 4, hidden_channels),
+            nn.Linear(hidden_channels * 2, hidden_channels),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_channels, 1)
@@ -766,6 +766,20 @@ def normalize_waveform_features(graph_dataset, feature_names):
     if invalid_mask.any():
         print(f"WARNING: Found {np.sum(invalid_mask)} invalid values in features. Replacing with zeros.")
         stacked_features[invalid_mask] = 0
+
+    mean = np.mean(stacked_features, axis=0)
+    std = np.std(stacked_features, axis=0)
+    
+    # Clip values beyond 3 standard deviations
+    lower_bound = mean - 3 * std
+    upper_bound = mean + 3 * std
+    
+    for i in range(stacked_features.shape[1]):
+        stacked_features[:, i] = np.clip(
+            stacked_features[:, i], 
+            lower_bound[i], 
+            upper_bound[i]
+        )
     
     # Use RobustScaler instead of StandardScaler to handle outliers better
     scaler = RobustScaler()
@@ -961,18 +975,18 @@ def train_waveform_gnn_model(graph_dataset, model, epochs=200, lr=0.001, batch_s
         if (epoch + 1) % 10 == 0:
             print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
         
-        # # Early stopping
-        # if val_loss < best_val_loss:
-        #     best_val_loss = val_loss
-        #     patience_counter = 0
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
             
-        #     # Save the best model
-        #     torch.save(model.state_dict(), 'results/waveform_gnn_model.pt')
-        # else:
-        #     patience_counter += 1
-        #     if patience_counter >= patience:
-        #         print(f"Early stopping at epoch {epoch+1}")
-        #         break
+            # Save the best model
+            torch.save(model.state_dict(), 'results/waveform_gnn_model.pt')
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch+1}")
+                break
     
     # Load the best model
     try:
