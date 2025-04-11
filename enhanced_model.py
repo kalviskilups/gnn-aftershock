@@ -128,7 +128,7 @@ class SimplerAfterShockGNN(torch.nn.Module):
     Simplified Graph Neural Network for aftershock prediction
     with better optimization properties
     """
-    def __init__(self, metadata_channels, waveform_channels, hidden_channels=64, dropout=0.3):
+    def __init__(self, metadata_channels, waveform_channels, hidden_channels=64, dropout=0.3, num_layers=3):
         super(SimplerAfterShockGNN, self).__init__()
         
         self.dropout = dropout
