@@ -9,269 +9,119 @@ import torch.nn.functional as F
 import math
 
 
-def train_model_with_diagnostics(
-    graph_dataset, model, epochs=200, lr=0.001, batch_size=32, patience=15
-):
-    """
-    Improved training function with proper loss function and diagnostics
-    """
-    import os
-    import torch
-    import numpy as np
-    import pandas as pd
-    import matplotlib.pyplot as plt
-    from sklearn.model_selection import train_test_split
-    from torch_geometric.loader import DataLoader
-    import torch.nn.functional as F
-
-    # Create results directory if it doesn't exist
-    os.makedirs("results", exist_ok=True)
-
-    # Split into training and validation sets
-    train_data, val_data = train_test_split(
-        graph_dataset, test_size=0.2, random_state=42
-    )
-
-    # Set follow_batch to ensure proper batching of all tensors
-    follow_batch = ["metadata", "waveform"]
-
-    # Adjust batch size if we have a small dataset
-    batch_size = min(batch_size, len(train_data) // 2)
-    if batch_size < 1:
-        batch_size = 1
-
-    # Create data loaders
-    train_loader = DataLoader(
-        train_data, batch_size=batch_size, shuffle=True, follow_batch=follow_batch
-    )
-    val_loader = DataLoader(val_data, batch_size=batch_size, follow_batch=follow_batch)
-
-    # Get device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-
-    # Use AdamW for better weight decay handling
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-
-    # Use OneCycleLR for better convergence
-    from torch.optim.lr_scheduler import OneCycleLR
-
-    scheduler = OneCycleLR(
-        optimizer,
-        max_lr=lr,
-        epochs=epochs,
-        steps_per_epoch=len(train_loader),
-        pct_start=0.3,  # Warm up for 30% of training
-        div_factor=25.0,  # Initial LR = max_lr/25
-        final_div_factor=10000.0,  # Final LR = max_lr/10000
-    )
-
-    # Improved loss function that doesn't divide by variance
-    def loss_function(pred, target):
-        """Simple MSE loss with L1 component for stability"""
-        distance = torch.sqrt(torch.sum((pred - target)**2, dim=1))
-        
-        # Use a mix of MSE and L1 loss
-        mse_loss = torch.mean(distance**2)
-        l1_loss = torch.mean(distance)
-        
-        return mse_loss
+def train_model_with_diagnostics(graph_dataset, model, epochs=300, lr=0.001, batch_size=32, patience=15):
+    """Train with improved stability measures"""
+    # Split dataset
+    train_data, val_data = train_test_split(graph_dataset, test_size=0.2, random_state=42)
     
-    def haversine_loss(pred, target):
-        """Loss function based on Haversine distance in km"""
-        # Convert to radians
-        pred_lat, pred_lon = pred[:, 0] * (math.pi/180), pred[:, 1] * (math.pi/180)
-        target_lat, target_lon = target[:, 0] * (math.pi/180), target[:, 1] * (math.pi/180)
+    # Create data loaders
+    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_data, batch_size=batch_size)
+    
+    # Initialize optimizer with lower learning rate
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    
+    # Add learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6
+    )
+    
+    # Loss function with L2 regularization
+    def loss_fn(pred, target, batch_size, diversity_weight=0.1):
+        """Loss function with diversity regularization"""
+        # Basic MSE loss
+        mse_loss = F.mse_loss(pred, target)
         
-        # Haversine formula components
-        dlat = target_lat - pred_lat
-        dlon = target_lon - pred_lon
+        # Diversity regularization
+        if batch_size > 1:
+            # Calculate variance of predictions
+            pred_var = torch.var(pred, dim=0)
+            target_var = torch.var(target, dim=0)
+            
+            # Penalize if prediction variance is too small compared to target variance
+            diversity_loss = F.mse_loss(pred_var, target_var)
+            
+            # Combined loss
+            total_loss = mse_loss + diversity_weight * diversity_loss
+        else:
+            total_loss = mse_loss
         
-        # Calculate Haversine distance
-        a = torch.sin(dlat/2)**2 + torch.cos(pred_lat) * torch.cos(target_lat) * torch.sin(dlon/2)**2
-        c = 2 * torch.asin(torch.sqrt(a))
-        distance_km = 6371 * c  # Earth radius in km
-        
-        # Use a more robust loss like Huber
-        delta = 100.0  # km threshold for outlier handling
-        huber_loss = torch.where(
-            distance_km < delta,
-            0.5 * distance_km**2,
-            delta * (distance_km - 0.5 * delta)
-        )
-        
-        return torch.mean(huber_loss)
-
-    # For early stopping
-    best_val_loss = float("inf")
+        return total_loss
+    
+    best_val_loss = float('inf')
     patience_counter = 0
-
-    # Training history
-    train_losses = []
-    val_losses = []
-
-    # For monitoring predictions
-    all_predictions = []
-
-    # Diagnostic function
-    def print_tensor_stats(prefix, tensor):
-        """Print statistics about a tensor for diagnostics"""
-        if tensor is not None:
-            stats = {
-                "mean": tensor.mean().item(),
-                "std": tensor.std().item() if tensor.numel() > 1 else 0,
-                "min": tensor.min().item(),
-                "max": tensor.max().item(),
-                "shape": tensor.shape,
-            }
-            print(f"{prefix}: {stats}")
-
-    # Training loop
+    
     for epoch in range(epochs):
-        # Training
         model.train()
         train_loss = 0.0
-
-        # Keep track of prediction changes
-        epoch_predictions = []
-
-        for batch_idx, batch in enumerate(train_loader):
-            batch = batch.to(device)
+        
+        for batch in train_loader:
             optimizer.zero_grad()
-
-            try:
-                # Forward pass
-                lat_pred, lon_pred = model(
-                    batch.metadata, batch.waveform, batch.edge_index, batch.batch
-                )
-
-                # Combine predictions
-                pred = torch.cat([lat_pred, lon_pred], dim=1)
-
-                # Save first batch predictions to monitor learning
-                if batch_idx == 0:
-                    epoch_predictions = pred.detach().cpu().numpy()
-
-                # Print diagnostics every 50 epochs for the first batch
-                if epoch % 50 == 0 and batch_idx == 0:
-                    print(f"\nEpoch {epoch} diagnostics:")
-                    print_tensor_stats("Predictions", pred)
-                    print_tensor_stats("Targets", batch.y)
-
-                    # Check gradients before backprop to see if they're flowing
-                    pred_mean = pred.mean()
-                    dummy_loss = (
-                        pred_mean  # Compute a simple loss to check gradient flow
-                    )
-                    dummy_loss.backward(
-                        retain_graph=True
-                    )  # retain_graph=True keeps the computational graph
-
-                    # Check if gradients are flowing to inputs
-                    grad_norms = []
-                    for name, param in model.named_parameters():
-                        if param.grad is not None:
-                            grad_norm = param.grad.norm().item()
-                            grad_norms.append(grad_norm)
-
-                    optimizer.zero_grad()  # Clear the dummy gradients
-
-                    print(
-                        f"Gradient stats - mean: {np.mean(grad_norms):.6f}, max: {np.max(grad_norms):.6f}, min: {np.min(grad_norms):.6f}"
-                    )
-
-                # Compute loss
-                loss = haversine_loss(pred, batch.y)
-
-                # Backward pass
-                loss.backward()
-
-                # Use a more appropriate clipping value
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-                optimizer.step()  # IMPORTANT: Make sure this line is uncommented
-                scheduler.step()  # Step LR scheduler every batch
-
-                train_loss += loss.item() * batch.num_graphs
-
-            except RuntimeError as e:
-                print(f"Error in batch processing: {e}")
-                # Skip this batch and continue with training
-                continue
-
-        train_loss /= len(train_data)
-        train_losses.append(train_loss)
-
-        # Store predictions to track changes
-        all_predictions.append(epoch_predictions)
-
+            
+            # Forward pass
+            lat_pred, lon_pred = model(batch.metadata, batch.waveform, 
+                                     batch.edge_index, batch.batch)
+            pred = torch.cat([lat_pred, lon_pred], dim=1)
+            
+            # Compute loss
+            loss = loss_fn(pred, batch.y, batch.num_graphs)
+            
+            # Backward pass
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            train_loss += loss.item()
+        
         # Validation
         model.eval()
         val_loss = 0.0
-
+        predictions = []
+        targets = []
+        
         with torch.no_grad():
             for batch in val_loader:
-                batch = batch.to(device)
-
-                try:
-                    # Forward pass
-                    lat_pred, lon_pred = model(
-                        batch.metadata, batch.waveform, batch.edge_index, batch.batch
-                    )
-
-                    # Combine predictions
-                    pred = torch.cat([lat_pred, lon_pred], dim=1)
-
-                    # Compute loss
-                    loss = haversine_loss(pred, batch.y)
-
-                    val_loss += loss.item() * batch.num_graphs
-
-                except RuntimeError as e:
-                    print(f"Error in validation batch processing: {e}")
-                    # Skip this batch
-                    continue
-
-        val_loss /= len(val_data)
-        val_losses.append(val_loss)
-
-        # Print progress
-        print(
-            f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}"
-        )
-
+                lat_pred, lon_pred = model(batch.metadata, batch.waveform, 
+                                         batch.edge_index, batch.batch)
+                pred = torch.cat([lat_pred, lon_pred], dim=1)
+                loss = F.mse_loss(pred, batch.y)
+                val_loss += loss.item()
+                
+                predictions.append(pred)
+                targets.append(batch.y)
+        
+        # Update learning rate
+        scheduler.step(val_loss)
+        
+        # Print progress every 10 epochs
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoch {epoch+1}/{epochs}")
+            print(f"Train Loss: {train_loss/len(train_loader):.4f}")
+            print(f"Val Loss: {val_loss/len(val_loader):.4f}")
+            print(f"Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
+            
+            # Print prediction statistics
+            all_preds = torch.cat(predictions)
+            all_targets = torch.cat(targets)
+            print(f"Prediction std: {torch.std(all_preds, dim=0)}")
+            print(f"Target std: {torch.std(all_targets, dim=0)}")
+        
         # Early stopping
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-
-            # Save the best model
-            torch.save(model.state_dict(), "results/simplified_aftershock_model.pt")
+            torch.save(model.state_dict(), 'results/best_model.pt')
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch+1}")
+                print("Early stopping triggered!")
                 break
-
-    # Load the best model
-    try:
-        model.load_state_dict(torch.load("results/simplified_aftershock_model.pt"))
-    except Exception as e:
-        print(f"Warning: Could not load best model: {e}")
-
-    # Plot training history
-    plt.figure(figsize=(10, 6))
-    plt.plot(train_losses, label="Training Loss")
-    plt.plot(val_losses, label="Validation Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Training and Validation Loss")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.savefig("results/simplified_training_history.png")
-    plt.close()
-
-    return model, train_losses, val_losses
+    
+    # Load best model
+    model.load_state_dict(torch.load('results/best_model.pt'))
+    return model
 
 
 def convert_relative_to_absolute_predictions(pred_deltas, references):
@@ -388,6 +238,29 @@ def evaluate_model(model, graph_dataset, mainshock, reference_coords):
     actual_lons = absolute_actual[:, 1]
     pred_lats = absolute_pred[:, 0]
     pred_lons = absolute_pred[:, 1]
+
+    # After collecting predictions
+    pred_lat_mean = np.mean(pred_lats)
+    pred_lat_std = np.std(pred_lats)
+    pred_lon_mean = np.mean(pred_lons)
+    pred_lon_std = np.std(pred_lons)
+
+    actual_lat_mean = np.mean(actual_lats)
+    actual_lat_std = np.std(actual_lats)
+    actual_lon_mean = np.mean(actual_lons)
+    actual_lon_std = np.std(actual_lons)
+
+    print(f"\nPrediction Distribution Analysis:")
+    print(f"  Predicted latitude - Mean: {pred_lat_mean:.6f}, Std: {pred_lat_std:.6f}")
+    print(f"  Actual latitude    - Mean: {actual_lat_mean:.6f}, Std: {actual_lat_std:.6f}")
+    print(f"  Predicted longitude - Mean: {pred_lon_mean:.6f}, Std: {pred_lon_std:.6f}")
+    print(f"  Actual longitude    - Mean: {actual_lon_mean:.6f}, Std: {actual_lon_std:.6f}")
+
+    # Calculate diversity ratio (predicted std / actual std)
+    lat_diversity = pred_lat_std / actual_lat_std if actual_lat_std > 0 else 0
+    lon_diversity = pred_lon_std / actual_lon_std if actual_lon_std > 0 else 0
+    print(f"  Latitude diversity ratio: {lat_diversity:.4f}")
+    print(f"  Longitude diversity ratio: {lon_diversity:.4f}")
 
     # Calculate error in kilometers
     errors_km = []

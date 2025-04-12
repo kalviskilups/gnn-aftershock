@@ -4,6 +4,8 @@ Modified Aftershock Prediction Pipeline with improved training approach (run_enh
 
 import os
 import argparse
+from sklearn.discriminant_analysis import StandardScaler
+from sklearn.preprocessing import RobustScaler
 import torch
 import numpy as np
 import pandas as pd
@@ -12,6 +14,7 @@ from datetime import datetime
 from sklearn.model_selection import train_test_split
 from torch_geometric.loader import DataLoader
 import torch.nn.functional as F
+from debug import *
 
 
 # Parse arguments with added options for improved training
@@ -37,7 +40,7 @@ def parse_arguments():
     parser.add_argument(
         "--sequence_length",
         type=int,
-        default=5,
+        default=3,
         help="Number of events in each sequence",
     )
     parser.add_argument(
@@ -61,8 +64,10 @@ def parse_arguments():
     parser.add_argument("--dropout", type=float, default=0.3, help="Dropout rate")
 
     # Training parameters
-    parser.add_argument("--epochs", type=int, default=300, help="Maximum training epochs")
-    parser.add_argument("--lr", type=float, default=0.005, help="Learning rate")
+    parser.add_argument(
+        "--epochs", type=int, default=300, help="Maximum training epochs"
+    )
+    parser.add_argument("--lr", type=float, default=0.05, help="Learning rate")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument(
         "--patience", type=int, default=15, help="Early stopping patience"
@@ -255,69 +260,55 @@ def prepare_sequences_with_relative_targets(
 
 
 def build_graphs_from_sequences(sequences, distance_threshold_km=25, debug=False):
-    """
-    Build graph representations from aftershock sequences with absolute targets
-    """
+    """Build graph representations with improved edge creation"""
     from torch_geometric.data import Data
-    import torch
-    import numpy as np
 
     graph_dataset = []
 
-    # Extract waveform feature names from the first sequence
+    # Extract feature names from first sequence
     if len(sequences) > 0:
         first_sequence_waveform_features = sequences[0][1]
         feature_names = sorted(list(first_sequence_waveform_features[0].keys()))
-        print(f"Using {len(feature_names)} waveform features: {feature_names[:5]}...")
     else:
-        feature_names = []
-        return graph_dataset, feature_names
+        return [], []
 
-    for seq_idx, (
-        metadata_features,
-        waveform_features_list,
-        target,
-    ) in enumerate(sequences):
-        if debug and seq_idx < 3:
-            print(f"\nSequence {seq_idx}:")
-            print(f"  Metadata shape: {metadata_features.shape}")
-            print(f"  Waveform features: {len(waveform_features_list)} events")
-            print(f"  Target: {target}")
-
+    for seq_idx, (metadata_features, waveform_features_list, target) in enumerate(
+        sequences
+    ):
         num_nodes = len(metadata_features)
 
-        # Convert metadata features to torch tensors
+        # Convert features to tensors
         metadata_tensor = torch.tensor(metadata_features, dtype=torch.float)
 
-        # Convert waveform features to torch tensors
+        # Process waveform features
         waveform_feature_matrix = []
         for waveform_features in waveform_features_list:
-            # Extract features in consistent order
             feature_values = [
                 waveform_features.get(name, 0.0) for name in feature_names
             ]
             waveform_feature_matrix.append(feature_values)
-
         waveform_tensor = torch.tensor(waveform_feature_matrix, dtype=torch.float)
 
-        # Convert target to torch tensor
+        # Convert target
         target_tensor = torch.tensor(target, dtype=torch.float).view(1, 2)
 
-        # Create edges based on spatiotemporal proximity
+        # Create edges based on temporal and spatial proximity
         edge_list = []
 
-        # Calculate distances between all pairs of events
-        for i in range(num_nodes):
-            for j in range(num_nodes):
-                if i == j:
-                    continue  # Skip self-loops
+        # Always add temporal edges
+        for i in range(num_nodes - 1):
+            edge_list.append([i, i + 1])  # Forward
+            edge_list.append([i + 1, i])  # Backward
 
-                # Calculate distance between events
+        # Add spatial edges if within threshold
+        for i in range(num_nodes):
+            for j in range(i + 1, num_nodes):
+                # Calculate distance
                 lat1, lon1 = metadata_features[i][0], metadata_features[i][1]
                 lat2, lon2 = metadata_features[j][0], metadata_features[j][1]
 
-                # Approximate distance using Haversine
-                R = 6371  # Earth radius in kilometers
+                # Haversine distance
+                R = 6371  # Earth radius in km
                 lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
                 dlat = lat2 - lat1
                 dlon = lon2 - lon1
@@ -328,41 +319,33 @@ def build_graphs_from_sequences(sequences, distance_threshold_km=25, debug=False
                 c = 2 * np.arcsin(np.sqrt(a))
                 distance = R * c
 
-                # Calculate time difference
-                time1 = metadata_features[i][3]  # hours since mainshock
-                time2 = metadata_features[j][3]
-                time_diff = abs(time2 - time1)
-
-                # Add edge based on distance and time relationship
-                if distance < distance_threshold_km and time_diff < 24:
+                # Add bidirectional edges if within threshold
+                if distance < distance_threshold_km:
                     edge_list.append([i, j])
+                    edge_list.append([j, i])
 
-        # If no edges created, add connections to temporal neighbors
-        if len(edge_list) == 0:
-            for i in range(num_nodes - 1):
-                edge_list.append([i, i + 1])
-                edge_list.append([i + 1, i])
-
-        # Convert edge list to torch tensor
+        # Convert edge list to tensor
         edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
 
-        # Create PyTorch Geometric Data object
+        # Create graph
         graph = Data(
             metadata=metadata_tensor,
             waveform=waveform_tensor,
             edge_index=edge_index,
             y=target_tensor,
-            num_nodes=metadata_tensor.size(0),
+            num_nodes=num_nodes,
         )
-
-        if debug and seq_idx < 3:
-            print(
-                f"  Created graph with {graph.num_nodes} nodes and {graph.edge_index.size(1)} edges"
-            )
 
         graph_dataset.append(graph)
 
-    print(f"Built {len(graph_dataset)} graph representations with absolute targets")
+        if debug and seq_idx < 3:
+            print(f"\nGraph {seq_idx + 1}:")
+            print(f"Nodes: {num_nodes}")
+            print(f"Edges: {len(edge_list)}")
+            print(f"Metadata shape: {metadata_tensor.shape}")
+            print(f"Waveform shape: {waveform_tensor.shape}")
+            print(f"Target: {target}")
+
     return graph_dataset, feature_names
 
 
@@ -717,13 +700,11 @@ def main():
         consolidate_station_recordings,
         normalize_waveform_features,
     )
-    from train_and_evaluate import (
-        train_model_with_diagnostics
-    )
+    from train_and_evaluate import train_model_with_diagnostics
 
     # Import the appropriate model based on user choice
     if args.model_type == "gcn":
-        from enhanced_model import SimplerAfterShockGNN as ModelClass
+        from enhanced_model import BalancedAfterShockGNN as ModelClass
 
         print("Using GCN-based model architecture")
     elif args.model_type == "baseline":
@@ -735,29 +716,122 @@ def main():
 
         print("Using GAT-based model architecture")
 
-    # Load and process data
+    """Main execution function with enhanced debugging"""
+    # Parse arguments
+    args = parse_arguments()
+
+    # Create results directory
+    os.makedirs("results", exist_ok=True)
+
+    # Record start time
+    start_time = datetime.now()
+    print(f"Starting Enhanced Aftershock GNN at {start_time}")
+
+    # Step 1: Load and preprocess data with waveforms
+    print("\n=== Loading and Preprocessing Data with Waveforms ===")
     metadata, iquique, waveform_features_dict = load_aftershock_data_with_waveforms(
         max_waveforms=args.max_waveforms
     )
 
-    # Consolidate recordings from the same event
-    print(f"Original dataset: {len(metadata)} recordings")
+    # Debug metadata and waveform features
+    debug_waveform_features(waveform_features_dict)
+
+    # Consolidate recordings
+    print("\n=== Consolidating Station Recordings ===")
     metadata, waveform_features_dict = consolidate_station_recordings(
         metadata, waveform_features_dict
     )
-    print(f"Consolidated dataset: {len(metadata)} unique events")
+
+    # Add normalization here
+    print("\n=== Normalizing Waveform Features ===")
+
+    def normalize_features(features_dict):
+        """
+        Normalize waveform features handling missing features and outliers
+        """
+        print("Starting feature normalization...")
+
+        # First collect all possible feature names
+        all_feature_names = set()
+        for features in features_dict.values():
+            all_feature_names.update(features.keys())
+        all_feature_names = sorted(list(all_feature_names))
+
+        print(f"Found {len(all_feature_names)} unique features")
+
+        # Create a matrix of all features, filling missing values with 0
+        feature_matrix = []
+        event_ids = []
+        for event_id, features in features_dict.items():
+            feature_vector = [features.get(fname, 0.0) for fname in all_feature_names]
+            feature_matrix.append(feature_vector)
+            event_ids.append(event_id)
+
+        feature_matrix = np.array(feature_matrix)
+
+        # Replace infinities with max/min finite values
+        feature_matrix[np.isinf(feature_matrix)] = np.nan
+        finite_max = np.nanmax(np.abs(feature_matrix[np.isfinite(feature_matrix)]))
+        feature_matrix[np.isnan(feature_matrix)] = finite_max
+
+        # Normalize each feature independently
+        scaler = (
+            RobustScaler()
+        )  # Use RobustScaler instead of StandardScaler to handle outliers better
+        try:
+            normalized = scaler.fit_transform(feature_matrix)
+
+            # Additional outlier handling: clip values to [-5, 5] range
+            normalized = np.clip(normalized, -5, 5)
+
+            print("Feature normalization statistics:")
+            print(f"Mean range: [{normalized.mean():.4f}, {normalized.std():.4f}]")
+            print(f"Value range: [{normalized.min():.4f}, {normalized.max():.4f}]")
+
+            # Convert back to dictionary format
+            normalized_dict = {}
+            for idx, event_id in enumerate(event_ids):
+                normalized_dict[event_id] = {
+                    fname: normalized[idx, i]
+                    for i, fname in enumerate(all_feature_names)
+                }
+
+            return normalized_dict
+
+        except Exception as e:
+            print(f"Error during normalization: {e}")
+            print("Feature matrix statistics:")
+            print(f"Shape: {feature_matrix.shape}")
+            print(f"Number of NaNs: {np.isnan(feature_matrix).sum()}")
+            print(f"Number of infinities: {np.isinf(feature_matrix).sum()}")
+            raise e
+
+    waveform_features_dict = normalize_features(waveform_features_dict)
+
+    # Print some statistics about the normalized features
+    sample_event = next(iter(waveform_features_dict.values()))
+    print(f"Feature statistics after normalization:")
+    print(
+        f"Mean range: [{min(sample_event.values()):.4f}, {max(sample_event.values()):.4f}]"
+    )
 
     # Identify mainshock and aftershocks
     mainshock, aftershocks = identify_mainshock_and_aftershocks(metadata)
 
-    # Step 2: Create aftershock sequences with waveform features and absolute targets
-    print("\n=== Creating Aftershock Sequences with Absolute Targets ===")
+    # Debug metadata after processing
+    debug_metadata(metadata, aftershocks, mainshock)
+
+    # Step 2: Create aftershock sequences
+    print("\n=== Creating Aftershock Sequences ===")
     sequences = prepare_sequences_with_absolute_targets(
         aftershocks,
         waveform_features_dict,
         sequence_length=args.sequence_length,
         time_window_hours=args.time_window,
     )
+
+    # Debug sequences
+    debug_sequences(sequences)
 
     if not sequences:
         print("No valid sequences created. Exiting.")
@@ -769,9 +843,16 @@ def main():
         sequences, distance_threshold_km=args.distance_threshold, debug=args.debug
     )
 
+    # Debug graphs
+    debug_graphs(graph_dataset, feature_names)
+
     if len(graph_dataset) == 0:
         print("No valid graph representations created. Exiting.")
         return
+
+    # Visualize sample graphs
+    for i in range(min(3, len(graph_dataset))):
+        visualize_graph_structure(graph_dataset[i], i)
 
     # Step 4: Create the appropriate model
     print(f"\n=== Creating {args.model_type.upper()} Model ===")
@@ -783,7 +864,6 @@ def main():
         metadata_channels=metadata_channels,
         waveform_channels=waveform_channels,
         hidden_channels=args.hidden_channels,
-        num_layers=3,
         dropout=args.dropout,
     ).to(device)
 
@@ -792,7 +872,7 @@ def main():
     # Step 5: Train the model (or load from file)
     if not args.skip_training:
         print("\n=== Training Model with Enhanced Diagnostics ===")
-        model, train_losses, val_losses = train_model_with_diagnostics(
+        model = train_model_with_diagnostics(
             graph_dataset,
             model,
             epochs=args.epochs,
