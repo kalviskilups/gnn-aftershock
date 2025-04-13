@@ -1,4 +1,10 @@
 import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+from sklearn.base import clone
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -6,8 +12,11 @@ from tqdm import tqdm
 import seisbench.data as sbd
 from scipy import signal
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression, Lasso
+from sklearn.ensemble import GradientBoostingRegressor
+from xgboost import XGBRegressor
 from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
 from sklearn.pipeline import Pipeline
 import logging
@@ -930,63 +939,21 @@ def train_location_prediction_model_holdout(ml_df):
     # Make sure none of these features include target data or are computed
     # using future values (we modified the rolling functions above).
     selected_features = [
-        # Original features
-        "Z_energy",
-        "N_energy",
-        "E_energy",
-        "Z_dominant_freq",
-        "N_dominant_freq",
-        "E_dominant_freq",
-        "Z_PS_ratio",
-        "N_PS_ratio",
-        "E_PS_ratio",
-        "P_Z_energy",
-        "P_N_energy",
-        "P_E_energy",
-        "S_Z_energy",
-        "S_N_energy",
-        "S_E_energy",
-        "hours_since_mainshock",
-        "log_hours",
-        "day_number",
-        "hours_since_last",
-        "Z_energy_ratio",
-        "N_energy_ratio",
-        "E_energy_ratio",
-        # New wavelet features
-        "Z_wavelet_band_0_energy",
-        "N_wavelet_band_0_energy",
-        "E_wavelet_band_0_energy",
-        "Z_wavelet_band_ratio_0_1",
-        "N_wavelet_band_ratio_0_1",
-        "E_wavelet_band_ratio_0_1",
-        # New spectrogram features
-        "Z_spec_dom_freq_std",
         "N_spec_dom_freq_std",
-        "E_spec_dom_freq_std",
-        "Z_low_freq_decay_rate",
-        "N_low_freq_decay_rate",
-        "E_low_freq_decay_rate",
-        # New polarization features
-        "P_linearity",
-        "P_planarity",
-        "S_linearity",
-        "S_planarity",
-        # New phase-specific features
-        "P_Z_dom_freq",
-        "P_N_dom_freq",
-        "P_E_dom_freq",
-        "S_Z_dom_freq",
-        "S_N_dom_freq",
-        "S_E_dom_freq",
-        "P_Z_LH_ratio",
-        "P_N_LH_ratio",
-        "P_E_LH_ratio",
         "S_Z_LH_ratio",
-        "S_N_LH_ratio",
         "S_E_LH_ratio",
-        # "depth_km",
-        # "depth_rolling_avg"
+        "log_hours",
+        "hours_since_mainshock",
+        "N_PS_ratio",
+        "Z_energy_ratio",
+        "Z_wavelet_band_ratio_0_1",
+        "Z_spec_dom_freq_std",
+        "Z_low_freq_decay_rate",
+        "N_energy_ratio",
+        "Z_PS_ratio",
+        "P_E_LH_ratio",
+        "day_number",
+        "P_linearity",
     ]
     # Ensure only available features are used
     selected_features = [feat for feat in selected_features if feat in ml_df.columns]
@@ -1237,6 +1204,370 @@ def visualize_results(ml_df, model, feature_importance, results, selected_featur
         print(f"  {metric}: {value:.4f}")
 
 
+def create_lstm_model(X_train, y_train, X_test, y_test):
+    """
+    Create and train an LSTM model for location prediction.
+
+    Args:
+        X_train: Training features
+        y_train: Training targets (lat, lon)
+        X_test: Test features
+        y_test: Test targets (lat, lon)
+
+    Returns:
+        Trained model, predictions, and scaler objects
+    """
+    # Set random seed for reproducibility
+    tf.random.set_seed(42)
+
+    # Scale features to [0,1] range
+    feature_scaler = MinMaxScaler()
+    X_train_scaled = feature_scaler.fit_transform(X_train)
+    X_test_scaled = feature_scaler.transform(X_test)
+
+    # Scale targets separately for each coordinate
+    lat_scaler = MinMaxScaler()
+    lon_scaler = MinMaxScaler()
+
+    # Fit and transform latitude
+    y_train_lat = lat_scaler.fit_transform(y_train["latitude"].values.reshape(-1, 1))
+    y_test_lat = lat_scaler.transform(y_test["latitude"].values.reshape(-1, 1))
+
+    # Fit and transform longitude
+    y_train_lon = lon_scaler.fit_transform(y_train["longitude"].values.reshape(-1, 1))
+    y_test_lon = lon_scaler.transform(y_test["longitude"].values.reshape(-1, 1))
+
+    # Reshape input for LSTM [samples, time steps, features]
+    # Since we're not using sequential data in the time dimension,
+    # we'll use 1 for the time steps dimension
+    X_train_reshaped = X_train_scaled.reshape(
+        X_train_scaled.shape[0], 1, X_train_scaled.shape[1]
+    )
+    X_test_reshaped = X_test_scaled.reshape(
+        X_test_scaled.shape[0], 1, X_test_scaled.shape[1]
+    )
+
+    # Create separate models for latitude and longitude
+
+    # Latitude model
+    lat_model = Sequential(
+        [
+            LSTM(64, input_shape=(1, X_train_scaled.shape[1]), return_sequences=True),
+            Dropout(0.2),
+            LSTM(32),
+            Dropout(0.2),
+            Dense(16, activation="relu"),
+            Dense(1),
+        ]
+    )
+
+    lat_model.compile(optimizer=Adam(learning_rate=0.001), loss="mse")
+
+    # Early stopping to prevent overfitting
+    early_stopping = EarlyStopping(
+        monitor="val_loss", patience=10, restore_best_weights=True
+    )
+
+    # Train latitude model
+    lat_model.fit(
+        X_train_reshaped,
+        y_train_lat,
+        epochs=100,
+        batch_size=32,
+        validation_split=0.2,
+        callbacks=[early_stopping],
+        verbose=0,
+    )
+
+    # Longitude model
+    lon_model = Sequential(
+        [
+            LSTM(64, input_shape=(1, X_train_scaled.shape[1]), return_sequences=True),
+            Dropout(0.2),
+            LSTM(32),
+            Dropout(0.2),
+            Dense(16, activation="relu"),
+            Dense(1),
+        ]
+    )
+
+    lon_model.compile(optimizer=Adam(learning_rate=0.001), loss="mse")
+
+    # Train longitude model
+    lon_model.fit(
+        X_train_reshaped,
+        y_train_lon,
+        epochs=100,
+        batch_size=32,
+        validation_split=0.2,
+        callbacks=[early_stopping],
+        verbose=0,
+    )
+
+    # Make predictions
+    lat_pred_scaled = lat_model.predict(X_test_reshaped, verbose=0)
+    lon_pred_scaled = lon_model.predict(X_test_reshaped, verbose=0)
+
+    # Inverse transform to get actual coordinates
+    lat_pred = lat_scaler.inverse_transform(lat_pred_scaled)
+    lon_pred = lon_scaler.inverse_transform(lon_pred_scaled)
+
+    # Combine predictions
+    y_pred = np.column_stack((lat_pred, lon_pred))
+
+    return {
+        "lat_model": lat_model,
+        "lon_model": lon_model,
+        "predictions": y_pred,
+        "feature_scaler": feature_scaler,
+        "lat_scaler": lat_scaler,
+        "lon_scaler": lon_scaler,
+    }
+
+
+def compare_models(ml_df, selected_features):
+    """
+    Train and evaluate multiple models on the same dataset
+    and return performance metrics for comparison.
+    """
+    # Prepare train/test split
+    train_df, test_df = prepare_holdout_split(ml_df, holdout_ratio=0.2)
+    X_train = train_df[selected_features]
+    y_train = train_df[["latitude", "longitude"]]
+    X_test = test_df[selected_features]
+    y_test = test_df[["latitude", "longitude"]]
+
+    # Define models to test - RandomForest supports multi-output directly
+    models = {
+        "RandomForest": {
+            "model": RandomForestRegressor(n_estimators=100, random_state=42),
+            "multi_output": True,
+        }
+    }
+
+    # Add models that require separate training for each output
+    single_output_models = {
+        "GradientBoosting": GradientBoostingRegressor(
+            n_estimators=100, random_state=42
+        ),
+        "XGBoost": XGBRegressor(n_estimators=100, random_state=42),
+        "LinearRegression": LinearRegression(),
+        "Lasso": Lasso(alpha=0.01, random_state=42),
+    }
+
+    # Store results
+    results = {}
+
+    # Train and evaluate each model
+    for model_name, model_config in models.items():
+        logging.info(f"Training {model_name}...")
+
+        # Create pipeline with standardization
+        pipeline = Pipeline(
+            [("scaler", StandardScaler()), ("model", model_config["model"])]
+        )
+
+        # Train the model
+        pipeline.fit(X_train, y_train)
+
+        # Make predictions
+        y_test_pred = pipeline.predict(X_test)
+
+        # Calculate errors
+        errors_km = calculate_distance_errors(y_test, y_test_pred)
+
+        # Calculate metrics
+        median_error_km = np.median(errors_km)
+        mean_error_km = np.mean(errors_km)
+        mae = mean_absolute_error(y_test, y_test_pred)
+        r2 = r2_score(y_test, y_test_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
+
+        # Store results
+        results[model_name] = {
+            "median_error_km": median_error_km,
+            "mean_error_km": mean_error_km,
+            "MAE": mae,
+            "R2": r2,
+            "RMSE": rmse,
+        }
+
+        logging.info(
+            f"{model_name} evaluation: MAE={mae:.4f}, "
+            f"Median Error={median_error_km:.2f} km, "
+            f"Mean Error={mean_error_km:.2f} km"
+        )
+
+    # Train and evaluate single-output models
+    for model_name, model in single_output_models.items():
+        logging.info(f"Training {model_name}...")
+
+        # We need separate models for latitude and longitude
+        lat_pipeline = Pipeline(
+            [
+                ("scaler", StandardScaler()),
+                ("model", clone(model)),  # Use clone to create a fresh copy
+            ]
+        )
+
+        lon_pipeline = Pipeline(
+            [
+                ("scaler", StandardScaler()),
+                ("model", clone(model)),  # Use clone to create a fresh copy
+            ]
+        )
+
+        # Train the models
+        lat_pipeline.fit(X_train, y_train["latitude"])
+        lon_pipeline.fit(X_train, y_train["longitude"])
+
+        # Make predictions
+        lat_pred = lat_pipeline.predict(X_test)
+        lon_pred = lon_pipeline.predict(X_test)
+
+        # Combine predictions
+        y_test_pred = np.column_stack((lat_pred, lon_pred))
+
+        # Calculate errors
+        errors_km = calculate_distance_errors(y_test, y_test_pred)
+
+        # Calculate metrics
+        median_error_km = np.median(errors_km)
+        mean_error_km = np.mean(errors_km)
+        mae = mean_absolute_error(y_test, y_test_pred)
+        r2 = r2_score(y_test, y_test_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
+
+        # Store results
+        results[model_name] = {
+            "median_error_km": median_error_km,
+            "mean_error_km": mean_error_km,
+            "MAE": mae,
+            "R2": r2,
+            "RMSE": rmse,
+        }
+
+        logging.info(
+            f"{model_name} evaluation: MAE={mae:.4f}, "
+            f"Median Error={median_error_km:.2f} km, "
+            f"Mean Error={mean_error_km:.2f} km"
+        )
+
+    # Add LSTM model
+    try:
+        logging.info(f"Training LSTM...")
+        lstm_results = create_lstm_model(X_train, y_train, X_test, y_test)
+        y_test_pred = lstm_results["predictions"]
+
+        # Calculate errors
+        errors_km = calculate_distance_errors(y_test, y_test_pred)
+
+        # Calculate metrics
+        median_error_km = np.median(errors_km)
+        mean_error_km = np.mean(errors_km)
+        mae = mean_absolute_error(y_test, y_test_pred)
+        r2 = r2_score(y_test, y_test_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
+
+        # Store results
+        results["LSTM"] = {
+            "median_error_km": median_error_km,
+            "mean_error_km": mean_error_km,
+            "MAE": mae,
+            "R2": r2,
+            "RMSE": rmse,
+        }
+
+        logging.info(
+            f"LSTM evaluation: MAE={mae:.4f}, "
+            f"Median Error={median_error_km:.2f} km, "
+            f"Mean Error={mean_error_km:.2f} km"
+        )
+    except Exception as e:
+        logging.error(f"Error training LSTM model: {e}")
+
+    return results
+
+
+def calculate_distance_errors(y_true, y_pred):
+    """Calculate haversine distances between true and predicted coordinates"""
+    errors_km = []
+    for i in range(len(y_true)):
+        if isinstance(y_true, pd.DataFrame):
+            true_lat, true_lon = y_true.iloc[i]
+        else:
+            true_lat, true_lon = y_true[i]
+
+        if isinstance(y_pred, pd.DataFrame):
+            pred_lat, pred_lon = y_pred.iloc[i]
+        else:
+            pred_lat, pred_lon = y_pred[i]
+
+        distance = haversine_distance(true_lat, true_lon, pred_lat, pred_lon)
+        errors_km.append(distance)
+    return errors_km
+
+
+def visualize_model_comparison(results):
+    """
+    Create visualizations to compare model performances.
+    """
+    # Bar chart of median errors
+    plt.figure(figsize=(12, 6))
+    models = list(results.keys())
+    median_errors = [results[model]["median_error_km"] for model in models]
+    plt.bar(models, median_errors, color="skyblue")
+    plt.title("Median Location Error by Model")
+    plt.ylabel("Error (km)")
+    plt.xticks(rotation=45)
+    plt.grid(axis="y", linestyle="--", alpha=0.7)
+    for i, v in enumerate(median_errors):
+        plt.text(i, v + 1, f"{v:.1f}", ha="center")
+    plt.tight_layout()
+    plt.savefig("model_comparison_median_error.png")
+    plt.close()
+
+    # Radar chart for multiple metrics
+    metrics = ["median_error_km", "mean_error_km", "MAE", "RMSE"]
+
+    # Prepare data
+    angles = np.linspace(0, 2 * np.pi, len(metrics), endpoint=False).tolist()
+    angles += angles[:1]  # Close the loop
+
+    fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(polar=True))
+
+    # Find max value for each metric to normalize
+    max_values = {}
+    for metric in metrics:
+        max_values[metric] = max([results[model][metric] for model in models])
+
+    for model in models:
+        values = [(results[model][metric] / max_values[metric]) for metric in metrics]
+        values += values[:1]  # Close the loop
+
+        ax.plot(angles, values, linewidth=2, label=model)
+        ax.fill(angles, values, alpha=0.1)
+
+    # Set labels
+    ax.set_thetagrids(np.degrees(angles[:-1]), metrics)
+    plt.legend(loc="upper right")
+    plt.title("Model Comparison (normalized metrics)")
+    plt.tight_layout()
+    plt.savefig("model_comparison_radar.png")
+    plt.close()
+
+    # Results table
+    print("\nModel Comparison Results:")
+    print("-" * 80)
+    headers = ["Model"] + [m for m in metrics]
+    print(f"{headers[0]:<20} " + " ".join([f"{h:>15}" for h in headers[1:]]))
+    print("-" * 80)
+
+    for model in models:
+        values = [f"{results[model][metric]:.2f}" for metric in metrics]
+        print(f"{model:<20} " + " ".join([f"{v:>15}" for v in values]))
+
+
 def main():
     """Main execution function"""
     start_time = datetime.datetime.now()
@@ -1329,24 +1660,55 @@ def main():
     logging.info(f"Dataset shape after feature engineering: {ml_df.shape}")
 
     # 6. Train location prediction model
-    logging.info("\nStep 6: Training location prediction model...")
-    model, cv_results, holdout_results, selected_features = (
-        train_location_prediction_model_holdout(ml_df)
-    )
-    importances = model.named_steps["model"].feature_importances_
-    feature_importance = pd.Series(importances, index=selected_features).sort_values(
-        ascending=False
-    )
+    # logging.info("\nStep 6: Training location prediction model...")
+    # model, cv_results, holdout_results, selected_features = (
+    #     train_location_prediction_model_holdout(ml_df)
+    # )
 
-    print("\nFeature Importance:")
-    for feature, importance in feature_importance.items():
-        print(f"{feature}: {importance:.4f}")
+    # 6. Define and select features
+    selected_features = [
+        # Your chosen features here
+        "N_spec_dom_freq_std",
+        "S_Z_LH_ratio",
+        "S_E_LH_ratio",
+        "log_hours",
+        "hours_since_mainshock",
+        "N_PS_ratio",
+        "Z_energy_ratio",
+        "Z_wavelet_band_ratio_0_1",
+        "Z_spec_dom_freq_std",
+        "Z_low_freq_decay_rate",
+        "N_energy_ratio",
+        "Z_PS_ratio",
+        "P_E_LH_ratio",
+        "day_number",
+        "P_linearity",
+    ]
+    # Ensure only available features are used
+    selected_features = [feat for feat in selected_features if feat in ml_df.columns]
+    logging.info(f"Selected {len(selected_features)} features for prediction.")
 
-    # 7. Visualize results
-    logging.info("\nStep 7: Visualizing results...")
-    visualize_results(
-        ml_df, model, feature_importance, holdout_results, selected_features
-    )
+    logging.info("\nStep 7: Comparing different models...")
+    model_results = compare_models(ml_df, selected_features)
+
+    # 8. Visualize comparison results
+    logging.info("\nStep 8: Visualizing comparison results...")
+    visualize_model_comparison(model_results)
+
+    # importances = model.named_steps["model"].feature_importances_
+    # feature_importance = pd.Series(importances, index=selected_features).sort_values(
+    #     ascending=False
+    # )
+
+    # print("\nFeature Importance:")
+    # for feature, importance in feature_importance.items():
+    #     print(f"{feature}: {importance:.4f}")
+
+    # # 7. Visualize results
+    # logging.info("\nStep 7: Visualizing results...")
+    # visualize_results(
+    #     ml_df, model, feature_importance, holdout_results, selected_features
+    # )
 
     # Log execution time
     end_time = datetime.datetime.now()
