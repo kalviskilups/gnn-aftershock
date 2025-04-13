@@ -13,6 +13,7 @@ from sklearn.pipeline import Pipeline
 import logging
 import os
 import datetime
+import pywt
 
 # Configure logging
 log_dir = "logs"
@@ -69,7 +70,7 @@ def load_aftershock_data_with_waveforms(max_waveforms):
     waveform_features_dict = {}
 
     # Initialize feature extractor with a focused set of features
-    feature_extractor = WaveformFeatureExtractor(focused=True)
+    feature_extractor = WaveformFeatureExtractor(focused=False)
 
     # Limit the number of waveforms to process
     sample_indices = metadata.index[: min(max_waveforms, len(metadata))]
@@ -346,7 +347,7 @@ class WaveformFeatureExtractor:
         self.focused = focused  # Use a smaller feature set if True
 
     def extract_features(self, waveform, p_arrival=None, s_arrival=None):
-        """Extract features from waveform data"""
+        """Extract comprehensive features from waveform data"""
         # Initialize feature dictionary
         features = {}
 
@@ -366,13 +367,29 @@ class WaveformFeatureExtractor:
                     features[f"{component_name}_std"] = np.std(component)
                     features[f"{component_name}_kurtosis"] = self._kurtosis(component)
 
-                # Calculate frequency-domain features
+                # Calculate standard frequency-domain features
                 freq_features = self._compute_frequency_features(component)
                 for feat_name, feat_value in freq_features.items():
                     features[f"{component_name}_{feat_name}"] = feat_value
 
+                # New advanced features - only compute when not in focused mode
+                # or if you want them even in focused mode
+                if not self.focused:
+                    # Add wavelet features if signal is long enough
+                    if len(component) >= 64:
+                        wavelet_features = self._compute_wavelet_features(component)
+                        for feat_name, feat_value in wavelet_features.items():
+                            features[f"{component_name}_{feat_name}"] = feat_value
+
+                    # Add spectrogram features if signal is long enough
+                    if len(component) >= 128:
+                        spec_features = self._compute_spectrogram_features(component)
+                        for feat_name, feat_value in spec_features.items():
+                            features[f"{component_name}_{feat_name}"] = feat_value
+
         # Extract P-wave and S-wave specific features if arrivals are provided
         if p_arrival is not None and s_arrival is not None:
+            # Original P/S wave features
             p_window_size = 100  # 100 samples after P arrival
             s_window_size = 100  # 100 samples after S arrival
 
@@ -381,7 +398,7 @@ class WaveformFeatureExtractor:
             s_window_size = min(s_window_size, waveform.shape[1] - s_arrival)
 
             if p_window_size > 0 and s_window_size > 0:
-                # Only extract key P/S wave features for focused mode
+                # Basic P/S wave features (keep the original code)
                 for i, component_name in enumerate(["Z", "N", "E"]):
                     if i < waveform.shape[0]:  # Check if component exists
                         p_segment = waveform[i, p_arrival : p_arrival + p_window_size]
@@ -398,6 +415,21 @@ class WaveformFeatureExtractor:
                         s_max = np.max(np.abs(s_segment))
                         if s_max > 0:
                             features[f"{component_name}_PS_ratio"] = p_max / s_max
+
+            # Add enhanced phase features if not in focused mode
+            if not self.focused:
+                # Add enhanced P/S wave features
+                phase_features = self._extract_phase_features(
+                    waveform, p_arrival, s_arrival
+                )
+                features.update(phase_features)
+
+                # Add polarization features if we have 3-component data
+                if waveform.shape[0] >= 3:
+                    pol_features = self._compute_polarization_features(
+                        waveform, p_arrival, s_arrival
+                    )
+                    features.update(pol_features)
 
         return features
 
@@ -460,6 +492,260 @@ class WaveformFeatureExtractor:
 
         kurt = np.mean(((x - mean) / std) ** 4) - 3
         return kurt
+
+    def _compute_wavelet_features(self, signal_segment):
+        """Extract features using wavelet decomposition"""
+        # Handle short signals
+        if len(signal_segment) < 64:
+            return {"wavelet_energy_ratio_1_2": 0, "wavelet_band_0_energy": 0}
+
+        try:
+            # Use a standard wavelet family (e.g., 'db4' Daubechies wavelets)
+            coeffs = pywt.wavedec(signal_segment, "db4", level=4)
+
+            # Extract energy in different frequency bands from wavelet coefficients
+            features = {}
+            for i, coeff in enumerate(coeffs):
+                band_energy = np.sum(coeff**2)
+                features[f"wavelet_band_{i}_energy"] = band_energy
+
+            # Calculate ratios between bands (can be informative for location)
+            if len(coeffs) > 1:
+                for i in range(len(coeffs) - 1):
+                    band_ratio = np.sum(coeffs[i] ** 2) / (
+                        np.sum(coeffs[i + 1] ** 2) + 1e-10
+                    )
+                    features[f"wavelet_band_ratio_{i}_{i+1}"] = band_ratio
+
+            return features
+        except Exception as e:
+            print(f"Error computing wavelet features: {e}")
+            return {"wavelet_energy_ratio_1_2": 0, "wavelet_band_0_energy": 0}
+
+    def _compute_spectrogram_features(self, signal_segment):
+        """Extract features from spectrogram of signal"""
+        # Handle short signals
+        if len(signal_segment) < 128:
+            return {"spec_dom_freq_std": 0, "low_freq_decay_rate": 0}
+
+        try:
+            f, t, Sxx = signal.spectrogram(
+                signal_segment,
+                fs=self.sampling_rate,
+                nperseg=min(128, len(signal_segment)),
+            )
+
+            features = {}
+
+            # Time evolution of frequency content
+            # For each time step, find dominant frequency
+            if Sxx.shape[1] > 1:  # Ensure we have multiple time steps
+                dom_freqs = f[np.argmax(Sxx, axis=0)]
+                features["spec_dom_freq_std"] = np.std(
+                    dom_freqs
+                )  # Variability in dominant frequency
+                features["spec_dom_freq_trend"] = (
+                    np.polyfit(np.arange(len(dom_freqs)), dom_freqs, 1)[0]
+                    if len(dom_freqs) > 2
+                    else 0
+                )  # Trend (slope)
+
+            # Frequency band energies over time
+            low_freq_idx = f < 5
+            high_freq_idx = f > 15
+
+            # Calculate how energy in different bands evolves over time
+            if np.any(low_freq_idx) and Sxx.shape[1] > 1:
+                low_energy_evolution = np.sum(Sxx[low_freq_idx, :], axis=0)
+                features["low_freq_decay_rate"] = (
+                    low_energy_evolution[0] - low_energy_evolution[-1]
+                ) / (len(low_energy_evolution) + 1e-10)
+
+            return features
+        except Exception as e:
+            print(f"Error computing spectrogram features: {e}")
+            return {"spec_dom_freq_std": 0, "low_freq_decay_rate": 0}
+
+    def _compute_polarization_features(self, waveform, p_arrival=None, s_arrival=None):
+        """Calculate polarization features from three-component waveform data"""
+        features = {}
+
+        # Need all three components for polarization analysis
+        if waveform.shape[0] < 3:
+            return features
+
+        # For P-wave window
+        if p_arrival is not None:
+            p_window_size = 100  # or adaptive as needed
+            p_window_size = min(p_window_size, waveform.shape[1] - p_arrival)
+
+            if p_window_size > 20:  # Ensure window is large enough
+                try:
+                    # Extract windows for all components
+                    z_p = waveform[0, p_arrival : p_arrival + p_window_size]
+                    n_p = waveform[1, p_arrival : p_arrival + p_window_size]
+                    e_p = waveform[2, p_arrival : p_arrival + p_window_size]
+
+                    # Covariance matrix of the three components
+                    data_matrix = np.vstack((z_p, n_p, e_p)).T
+                    cov_matrix = np.cov(data_matrix.T)
+
+                    # Eigendecomposition to get polarization attributes
+                    eigvals, eigvecs = np.linalg.eigh(cov_matrix)
+
+                    # Sort eigenvalues and eigenvectors in descending order
+                    idx = eigvals.argsort()[::-1]
+                    eigvals = eigvals[idx]
+                    eigvecs = eigvecs[:, idx]
+
+                    # Linearity, planarity, and rectilinearity measures
+                    if sum(eigvals) > 0:
+                        features["P_linearity"] = 1 - (eigvals[1] + eigvals[2]) / (
+                            2 * eigvals[0] + 1e-10
+                        )
+                        features["P_planarity"] = 1 - (2 * eigvals[2]) / (
+                            eigvals[0] + eigvals[1] + 1e-10
+                        )
+
+                        # Direction of polarization (simplified)
+                        # Convert first eigenvector to spherical coordinates
+                        v = eigvecs[:, 0]
+                        r = np.sqrt(np.sum(v**2))
+                        if r > 0:
+                            theta = np.arccos(v[0] / r)  # Angle from Z axis
+                            phi = np.arctan2(v[2], v[1])  # Azimuth
+                            features["P_pol_theta"] = theta
+                            features["P_pol_phi"] = phi
+                except Exception as e:
+                    print(f"Error computing P-wave polarization: {e}")
+
+        # Similar analysis for S-wave window if needed
+        if s_arrival is not None:
+            s_window_size = 100
+            s_window_size = min(s_window_size, waveform.shape[1] - s_arrival)
+
+            if s_window_size > 20:
+                try:
+                    # Similar calculation for S-waves
+                    z_s = waveform[0, s_arrival : s_arrival + s_window_size]
+                    n_s = waveform[1, s_arrival : s_arrival + s_window_size]
+                    e_s = waveform[2, s_arrival : s_arrival + s_window_size]
+
+                    data_matrix = np.vstack((z_s, n_s, e_s)).T
+                    cov_matrix = np.cov(data_matrix.T)
+
+                    eigvals, eigvecs = np.linalg.eigh(cov_matrix)
+                    idx = eigvals.argsort()[::-1]
+                    eigvals = eigvals[idx]
+                    eigvecs = eigvecs[:, idx]
+
+                    if sum(eigvals) > 0:
+                        features["S_linearity"] = 1 - (eigvals[1] + eigvals[2]) / (
+                            2 * eigvals[0] + 1e-10
+                        )
+                        features["S_planarity"] = 1 - (2 * eigvals[2]) / (
+                            eigvals[0] + eigvals[1] + 1e-10
+                        )
+                except Exception as e:
+                    print(f"Error computing S-wave polarization: {e}")
+
+        return features
+
+    def _extract_phase_features(self, waveform, p_arrival, s_arrival):
+        """Extract more detailed features from P and S wave windows"""
+        features = {}
+
+        # Define adaptive window sizes based on expected separation of phases
+        if p_arrival is not None and s_arrival is not None:
+            s_p_time = s_arrival - p_arrival
+
+            # P-wave window - use smaller of 100 samples or 80% of S-P time
+            p_window_size = min(100, int(0.8 * s_p_time))
+
+            # S-wave window - use window scaled by S-P time
+            s_window_size = min(150, int(1.2 * s_p_time))
+
+            # Ensure window sizes don't exceed waveform length
+            p_window_size = min(p_window_size, waveform.shape[1] - p_arrival)
+            s_window_size = min(s_window_size, waveform.shape[1] - s_arrival)
+
+            if (
+                p_window_size > 10 and s_window_size > 10
+            ):  # Ensure windows are large enough
+                for i, component_name in enumerate(["Z", "N", "E"]):
+                    if i < waveform.shape[0]:
+                        try:
+                            # Extract appropriate windows
+                            p_segment = waveform[
+                                i, p_arrival : p_arrival + p_window_size
+                            ]
+                            s_segment = waveform[
+                                i, s_arrival : s_arrival + s_window_size
+                            ]
+
+                            # Frequency content
+                            f_p, Pxx_p = signal.welch(
+                                p_segment,
+                                fs=self.sampling_rate,
+                                nperseg=min(64, len(p_segment)),
+                            )
+                            f_s, Pxx_s = signal.welch(
+                                s_segment,
+                                fs=self.sampling_rate,
+                                nperseg=min(64, len(s_segment)),
+                            )
+
+                            # Dominant frequencies
+                            if len(Pxx_p) > 0:
+                                features[f"P_{component_name}_dom_freq"] = f_p[
+                                    np.argmax(Pxx_p)
+                                ]
+                            if len(Pxx_s) > 0:
+                                features[f"S_{component_name}_dom_freq"] = f_s[
+                                    np.argmax(Pxx_s)
+                                ]
+
+                            # Spectral ratios
+                            p_low_idx = f_p < 5 if len(f_p) > 0 else []
+                            p_high_idx = f_p > 15 if len(f_p) > 0 else []
+                            s_low_idx = f_s < 5 if len(f_s) > 0 else []
+                            s_high_idx = f_s > 15 if len(f_s) > 0 else []
+
+                            p_low_energy = (
+                                np.sum(Pxx_p[p_low_idx])
+                                if len(p_low_idx) > 0 and any(p_low_idx)
+                                else 0
+                            )
+                            p_high_energy = (
+                                np.sum(Pxx_p[p_high_idx])
+                                if len(p_high_idx) > 0 and any(p_high_idx)
+                                else 0
+                            )
+                            s_low_energy = (
+                                np.sum(Pxx_s[s_low_idx])
+                                if len(s_low_idx) > 0 and any(s_low_idx)
+                                else 0
+                            )
+                            s_high_energy = (
+                                np.sum(Pxx_s[s_high_idx])
+                                if len(s_high_idx) > 0 and any(s_high_idx)
+                                else 0
+                            )
+
+                            if p_high_energy > 0:
+                                features[f"P_{component_name}_LH_ratio"] = (
+                                    p_low_energy / p_high_energy
+                                )
+                            if s_high_energy > 0:
+                                features[f"S_{component_name}_LH_ratio"] = (
+                                    s_low_energy / s_high_energy
+                                )
+                        except Exception as e:
+                            print(
+                                f"Error extracting phase features for {component_name}: {e}"
+                            )
+
+        return features
 
 
 def prepare_ml_dataset(aftershocks, consolidated_features):
@@ -644,6 +930,7 @@ def train_location_prediction_model_holdout(ml_df):
     # Make sure none of these features include target data or are computed
     # using future values (we modified the rolling functions above).
     selected_features = [
+        # Original features
         "Z_energy",
         "N_energy",
         "E_energy",
@@ -659,16 +946,47 @@ def train_location_prediction_model_holdout(ml_df):
         "S_Z_energy",
         "S_N_energy",
         "S_E_energy",
-        # "depth_km",
         "hours_since_mainshock",
         "log_hours",
         "day_number",
         "hours_since_last",
-        # "depth_rolling_avg",
-        # "depth_rolling_std",
         "Z_energy_ratio",
         "N_energy_ratio",
         "E_energy_ratio",
+        # New wavelet features
+        "Z_wavelet_band_0_energy",
+        "N_wavelet_band_0_energy",
+        "E_wavelet_band_0_energy",
+        "Z_wavelet_band_ratio_0_1",
+        "N_wavelet_band_ratio_0_1",
+        "E_wavelet_band_ratio_0_1",
+        # New spectrogram features
+        "Z_spec_dom_freq_std",
+        "N_spec_dom_freq_std",
+        "E_spec_dom_freq_std",
+        "Z_low_freq_decay_rate",
+        "N_low_freq_decay_rate",
+        "E_low_freq_decay_rate",
+        # New polarization features
+        "P_linearity",
+        "P_planarity",
+        "S_linearity",
+        "S_planarity",
+        # New phase-specific features
+        "P_Z_dom_freq",
+        "P_N_dom_freq",
+        "P_E_dom_freq",
+        "S_Z_dom_freq",
+        "S_N_dom_freq",
+        "S_E_dom_freq",
+        "P_Z_LH_ratio",
+        "P_N_LH_ratio",
+        "P_E_LH_ratio",
+        "S_Z_LH_ratio",
+        "S_N_LH_ratio",
+        "S_E_LH_ratio",
+        # "depth_km",
+        # "depth_rolling_avg"
     ]
     # Ensure only available features are used
     selected_features = [feat for feat in selected_features if feat in ml_df.columns]
