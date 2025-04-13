@@ -43,37 +43,125 @@ def read_data_from_pickle(file_path):
     return df
 
 
+def haversine_loss(y_pred, y_true):
+    """
+    Custom loss function based on Haversine distance for lat/lon and depth.
+
+    Args:
+        y_pred: tensor of shape (batch_size, 3) [lat, lon, depth]
+        y_true: tensor of shape (batch_size, 3) [lat, lon, depth]
+    """
+    # Convert to radians
+    lat1, lon1 = torch.deg2rad(y_pred[:, 0]), torch.deg2rad(y_pred[:, 1])
+    lat2, lon2 = torch.deg2rad(y_true[:, 0]), torch.deg2rad(y_true[:, 1])
+
+    # Haversine formula for horizontal distance
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = (
+        torch.sin(dlat / 2) ** 2
+        + torch.cos(lat1) * torch.cos(lat2) * torch.sin(dlon / 2) ** 2
+    )
+    c = 2 * torch.asin(torch.sqrt(a))
+    r = 6371.0  # Radius of Earth in kilometers
+
+    # Horizontal distance
+    h_dist = c * r
+
+    # Depth error (in km)
+    d_dist = torch.abs(y_pred[:, 2] - y_true[:, 2])
+
+    # Total 3D distance (Euclidean approximation)
+    dist_3d = torch.sqrt(h_dist**2 + d_dist**2)
+
+    # Return mean distance
+    return torch.mean(dist_3d)
+
+
 def extract_waveform_features(waveform):
     """
-    Extract relevant features from a seismic waveform.
+    Extract enhanced features from a seismic waveform.
     """
     features = []
     for component in range(waveform.shape[0]):
+        signal = waveform[component]
+
         # Time domain features
-        features.append(np.max(np.abs(waveform[component])))  # Peak amplitude
-        features.append(np.mean(np.abs(waveform[component])))  # Mean amplitude
-        features.append(np.std(waveform[component]))  # Standard deviation
+        features.extend(
+            [
+                np.max(np.abs(signal)),  # Peak amplitude
+                np.mean(np.abs(signal)),  # Mean amplitude
+                np.std(signal),  # Standard deviation
+                np.percentile(signal, 25),  # 25th percentile
+                np.percentile(signal, 75),  # 75th percentile
+                np.median(signal),  # Median
+                np.mean(np.diff(signal) ** 2),  # Mean squared difference
+                np.max(signal) - np.min(signal),  # Range
+                np.sum(np.abs(signal)),  # Total energy
+                np.mean(np.abs(np.diff(signal))),  # Mean absolute change
+                # Zero crossing rate
+                np.sum(np.abs(np.diff(np.signbit(signal)))) / (2 * len(signal)),
+            ]
+        )
 
         # Frequency domain features
-        fft = np.abs(np.fft.rfft(waveform[component]))
-        features.append(np.argmax(fft))  # Dominant frequency index
-        features.append(np.max(fft))  # Maximum frequency amplitude
-        features.append(np.sum(fft))  # Total spectral energy
+        fft = np.abs(np.fft.rfft(signal))
 
-        # Add ratios of different frequency bands
-        low_freq = np.sum(fft[: len(fft) // 3])
-        mid_freq = np.sum(fft[len(fft) // 3 : 2 * len(fft) // 3])
-        high_freq = np.sum(fft[2 * len(fft) // 3 :])
+        # Basic spectral features
+        features.extend(
+            [
+                np.argmax(fft),  # Dominant frequency index
+                np.max(fft),  # Maximum amplitude
+                np.sum(fft),  # Total spectral energy
+                np.mean(fft),  # Mean spectral amplitude
+                np.std(fft),  # Spectral standard deviation
+            ]
+        )
 
-        if low_freq > 0:
-            features.append(high_freq / low_freq)  # High/Low ratio
+        # Energy in frequency bands (customized for seismic data)
+        # Adjust frequency bands as needed for your specific data
+        low_band = fft[: len(fft) // 4]  # 0-25% of frequencies
+        mid_low_band = fft[len(fft) // 4 : len(fft) // 2]  # 25-50%
+        mid_high_band = fft[len(fft) // 2 : 3 * len(fft) // 4]  # 50-75%
+        high_band = fft[3 * len(fft) // 4 :]  # 75-100%
+
+        low_energy = np.sum(low_band)
+        mid_low_energy = np.sum(mid_low_band)
+        mid_high_energy = np.sum(mid_high_band)
+        high_energy = np.sum(high_band)
+        total_energy = np.sum(fft)
+
+        # Absolute energy in bands
+        features.extend([low_energy, mid_low_energy, mid_high_energy, high_energy])
+
+        # Energy ratios (if non-zero)
+        if total_energy > 0:
+            features.extend(
+                [
+                    low_energy / total_energy,
+                    mid_low_energy / total_energy,
+                    mid_high_energy / total_energy,
+                    high_energy / total_energy,
+                ]
+            )
         else:
-            features.append(0)
+            features.extend([0, 0, 0, 0])
 
-        if mid_freq > 0:
-            features.append(high_freq / mid_freq)  # High/Mid ratio
+        # Seismic-specific features
+        # P-wave and S-wave energy ratio (simplified)
+        # Assuming first 1/3 is mostly P-waves, last 2/3 mostly S-waves
+        p_wave_section = signal[: len(signal) // 3]
+        s_wave_section = signal[len(signal) // 3 :]
+
+        p_energy = np.sum(p_wave_section**2)
+        s_energy = np.sum(s_wave_section**2)
+
+        if p_energy > 0:
+            s_p_ratio = s_energy / p_energy
         else:
-            features.append(0)
+            s_p_ratio = 0
+
+        features.extend([p_energy, s_energy, s_p_ratio])
 
     return np.array(features)
 
@@ -480,7 +568,7 @@ class GNNAftershockPredictor:
             target = data.y[target_indices, :]
 
             # Calculate loss
-            loss = self.criterion(pred, target)
+            loss = haversine_loss(pred, target)
 
             # Backward pass
             loss.backward()
@@ -531,7 +619,7 @@ class GNNAftershockPredictor:
                 target = data.y[target_indices, :]
 
                 # Calculate loss
-                loss = self.criterion(pred, target)
+                loss = haversine_loss(pred, target)
                 val_loss += loss.item() * len(target_indices)
 
         return val_loss / len(self.val_data)
@@ -579,7 +667,7 @@ class GNNAftershockPredictor:
                 target = data.y[target_indices, :]
 
                 # Calculate loss
-                loss = self.criterion(pred, target)
+                loss = haversine_loss(pred, target)
                 test_loss += loss.item() * len(target_indices)
 
                 # Save predictions and targets
@@ -797,12 +885,14 @@ def main():
     print("Reading data from pickle file...")
     df = read_data_from_pickle("aftershock_data.pkl")
 
+    print(df)
+
     # Display data info
     print(f"Dataset loaded. Total events: {len(df)}")
 
     # Create spatiotemporal graphs
     graph_data_list = create_spatiotemporal_graphs(
-        df, time_window=48, distance_threshold=75
+        df, time_window=10, distance_threshold=10
     )
 
     # Set device (GPU if available)
