@@ -2,935 +2,763 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-import logging
+from tqdm import tqdm
+import pickle
 import os
-import sys
-import datetime
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
+import time
+from datetime import datetime
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, GATv2Conv, global_mean_pool
-from torch_geometric.data import Data, DataLoader
-from torch_geometric.utils import add_self_loops
-from tqdm import tqdm
-import logging
-from main_approach import *
+from torch.utils.data import Dataset, DataLoader
+from torch_geometric.nn import GCNConv, GraphConv, GATConv, SAGEConv
+from torch_geometric.data import Data, Batch
+from torch_geometric.utils import to_undirected
+from torch_geometric.data import DataLoader as PyGDataLoader
+from torch_geometric.nn import global_mean_pool
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score
 
-
-# Configure logging
-log_dir = "logs"
-if not os.path.exists(log_dir):
-    os.makedirs(log_dir)
-
-log_filename = os.path.join(
-    log_dir,
-    f"aftershock_prediction_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
-)
-
-# Set up logging to both console and file
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler(log_filename), logging.StreamHandler()],
-)
-
-# Set style for plots
-plt.style.use("seaborn-v0_8-whitegrid")
-sns.set_context("paper")
-
-# Reuse your existing functions for data loading and feature extraction
-# We'll focus on the GNN implementation
-
-
-class AfterShockGNN(nn.Module):
+def read_data_from_pickle(file_path):
     """
-    Graph Neural Network for aftershock location prediction
+    Load the data from pickle file.
     """
+    # Load the pickle file that contains the data dictionary
+    with open(file_path, "rb") as file:
+        data_dict = pickle.load(file)
 
-    def __init__(self, input_dim, hidden_dim=64, output_dim=2, num_layers=3):
-        super(AfterShockGNN, self).__init__()
+    # Extract the metadata from each event entry.
+    data_list = [
+        {**entry["metadata"], "waveform": entry["waveform"]}
+        for entry in data_dict.values()
+    ]
+    # Convert the list of metadata dictionaries into a DataFrame
+    df = pd.DataFrame(data_list)
 
-        self.num_layers = num_layers
+    return df
 
-        # Input layer
-        self.conv_first = GCNConv(input_dim, hidden_dim)
-
-        # Hidden layers
-        self.convs = nn.ModuleList()
-        for i in range(num_layers - 2):
-            self.convs.append(GCNConv(hidden_dim, hidden_dim))
-
-        # Final layer for prediction
-        self.conv_last = GCNConv(hidden_dim, hidden_dim)
-
-        # MLP for final prediction
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim, output_dim),
-        )
-
-    def forward(self, x, edge_index, batch=None):
-        # First layer
-        x = self.conv_first(x, edge_index)
-        x = F.relu(x)
-        x = F.dropout(x, p=0.2, training=self.training)
-
-        # Hidden layers
-        for i in range(len(self.convs)):
-            x = self.convs[i](x, edge_index)
-            x = F.relu(x)
-            x = F.dropout(x, p=0.2, training=self.training)
-
-        # Last layer
-        x = self.conv_last(x, edge_index)
-        x = F.relu(x)
-
-        # If batch is not None, we're in batch mode
-        if batch is not None:
-            x = global_mean_pool(x, batch)
-
-        # Final prediction through MLP
-        x = self.mlp(x)
-
-        return x
-
-
-class GATAfterShockModel(nn.Module):
+def extract_waveform_features(waveform):
     """
-    Graph Attention Network for aftershock location prediction
+    Extract relevant features from a seismic waveform.
     """
-
-    def __init__(self, input_dim, hidden_dim=64, output_dim=2, num_layers=3, heads=4):
-        super(GATAfterShockModel, self).__init__()
-
-        self.num_layers = num_layers
-
-        # Input layer with multi-head attention
-        self.conv_first = GATv2Conv(input_dim, hidden_dim // heads, heads=heads)
-
-        # Hidden layers
-        self.convs = nn.ModuleList()
-        for i in range(num_layers - 2):
-            self.convs.append(GATv2Conv(hidden_dim, hidden_dim // heads, heads=heads))
-
-        # Final GAT layer
-        self.conv_last = GATv2Conv(hidden_dim, hidden_dim, heads=1)
-
-        # MLP for final prediction
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim, output_dim),
-        )
-
-    def forward(self, x, edge_index, batch=None):
-        # First layer
-        x = self.conv_first(x, edge_index)
-        x = F.relu(x)
-        x = F.dropout(x, p=0.2, training=self.training)
-
-        # Hidden layers
-        for i in range(len(self.convs)):
-            x = self.convs[i](x, edge_index)
-            x = F.relu(x)
-            x = F.dropout(x, p=0.2, training=self.training)
-
-        # Last layer
-        x = self.conv_last(x, edge_index)
-        x = F.relu(x)
-
-        # If batch is not None, we're in batch mode
-        if batch is not None:
-            x = global_mean_pool(x, batch)
-
-        # Final prediction through MLP
-        x = self.mlp(x)
-
-        return x
-
-
-def build_aftershock_graph(
-    ml_df, selected_features, max_distance=100, max_time_diff=48
-):
-    """
-    Build a graph from aftershock data
-
-    Args:
-        ml_df: DataFrame with aftershock data
-        selected_features: List of features to use for node attributes
-        max_distance: Maximum distance (km) for connecting nodes
-        max_time_diff: Maximum time difference (hours) for connecting nodes
-
-    Returns:
-        PyTorch Geometric Data object
-    """
-    # Sort by time
-    ml_df = ml_df.sort_values("hours_since_mainshock").reset_index(drop=True)
-
-    # Extract features and targets
-    X = ml_df[selected_features].values
-    y = ml_df[["latitude", "longitude"]].values
-
-    # Scale features
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    # Convert to torch tensors
-    x = torch.tensor(X_scaled, dtype=torch.float)
-    y = torch.tensor(y, dtype=torch.float)
-
-    # Create edge list
-    edge_index = []
-    edge_attr = []
-
-    # Iterate through all pairs of aftershocks
-    for i in range(len(ml_df)):
-        for j in range(i):  # Only connect to previous aftershocks
-            # Calculate time difference
-            time_diff = (
-                ml_df.iloc[i]["hours_since_mainshock"]
-                - ml_df.iloc[j]["hours_since_mainshock"]
-            )
-
-            # Calculate spatial distance
-            distance = haversine_distance(
-                ml_df.iloc[i]["latitude"],
-                ml_df.iloc[i]["longitude"],
-                ml_df.iloc[j]["latitude"],
-                ml_df.iloc[j]["longitude"],
-            )
-
-            # Add edges if within thresholds
-            if time_diff <= max_time_diff and distance <= max_distance:
-                edge_index.append([j, i])  # j -> i (past to future)
-                edge_attr.append([time_diff, distance])
-
-    # Check if we have any edges
-    if not edge_index:
-        logging.warning(
-            "No edges found in the graph! Consider adjusting max_distance and max_time_diff"
-        )
-        # Add placeholder edges to avoid errors
-        edge_index = [[0, 0]]
-        edge_attr = [[0, 0]]
-
-    # Convert edge lists to tensors
-    edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
-    edge_attr = torch.tensor(edge_attr, dtype=torch.float)
-
-    # Add self-loops
-    edge_index, _ = add_self_loops(edge_index, num_nodes=len(ml_df))
-
-    # Create PyTorch Geometric Data object
-    data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
-
-    logging.info(f"Built graph with {len(ml_df)} nodes and {edge_index.size(1)} edges")
-
-    return data, scaler
-
-
-def train_gnn_model(graph_data, model, epochs=200, lr=0.001):
-    """
-    Train a GNN model for aftershock location prediction
-
-    Args:
-        graph_data: PyTorch Geometric Data object
-        model: The GNN model
-        epochs: Number of training epochs
-        lr: Learning rate
-
-    Returns:
-        Trained model and training history
-    """
-    # Split into train and test sets (time-aware)
-    num_nodes = graph_data.x.size(0)
-    train_size = int(0.8 * num_nodes)
-
-    # Time-ordered split
-    train_mask = torch.zeros(num_nodes, dtype=torch.bool)
-    test_mask = torch.zeros(num_nodes, dtype=torch.bool)
-    train_mask[:train_size] = True
-    test_mask[train_size:] = True
-
-    # Setup optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
-
-    # Training loop
-    model.train()
-    history = {
-        "train_loss": [],
-        "val_loss": [],
-        "mean_error_km": [],
-        "median_error_km": [],
-    }
-
-    for epoch in range(epochs):
-        # Forward pass
-        optimizer.zero_grad()
-        out = model(graph_data.x, graph_data.edge_index)
-
-        # Calculate loss
-        loss = criterion(out[train_mask], graph_data.y[train_mask])
-
-        # Backward pass
-        loss.backward()
-        optimizer.step()
-
-        # Log training loss
-        history["train_loss"].append(loss.item())
-
-        # Validation
-        if epoch % 10 == 0:
-            model.eval()
-            with torch.no_grad():
-                val_out = model(graph_data.x, graph_data.edge_index)
-                val_loss = criterion(val_out[test_mask], graph_data.y[test_mask])
-                history["val_loss"].append(val_loss.item())
-
-                # Calculate error in kilometers
-                pred_coords = val_out[test_mask].detach().numpy()
-                true_coords = graph_data.y[test_mask].detach().numpy()
-
-                errors_km = []
-                for i in range(len(pred_coords)):
-                    error = haversine_distance(
-                        true_coords[i, 0],
-                        true_coords[i, 1],
-                        pred_coords[i, 0],
-                        pred_coords[i, 1],
-                    )
-                    errors_km.append(error)
-
-                mean_error = np.mean(errors_km)
-                median_error = np.median(errors_km)
-                history["mean_error_km"].append(mean_error)
-                history["median_error_km"].append(median_error)
-
-                logging.info(
-                    f"Epoch {epoch}: Train Loss: {loss.item():.4f}, Val Loss: {val_loss.item():.4f}, "
-                    f"Mean Error: {mean_error:.2f} km, Median Error: {median_error:.2f} km"
-                )
-
-            model.train()
-
-    return model, history
-
-
-def evaluate_gnn_model(graph_data, model, scaler, test_mask):
-    """
-    Evaluate GNN model performance with detailed metrics
-
-    Args:
-        graph_data: PyTorch Geometric Data object
-        model: Trained GNN model
-        scaler: Feature scaler
-        test_mask: Mask for test nodes
-
-    Returns:
-        Dictionary of performance metrics
-    """
-    model.eval()
-
-    with torch.no_grad():
-        # Get predictions
-        pred = model(graph_data.x, graph_data.edge_index)
-        pred_test = pred[test_mask].detach().numpy()
-        true_test = graph_data.y[test_mask].detach().numpy()
-
-        # Calculate errors in kilometers
-        errors_km = []
-        for i in range(len(pred_test)):
-            error = haversine_distance(
-                true_test[i, 0], true_test[i, 1], pred_test[i, 0], pred_test[i, 1]
-            )
-            errors_km.append(error)
-
-        # Calculate metrics
-        mean_error = np.mean(errors_km)
-        median_error = np.median(errors_km)
-        mae = np.mean(np.abs(pred_test - true_test))
-        mse = np.mean((pred_test - true_test) ** 2)
-        rmse = np.sqrt(mse)
-
-        # Return metrics
-        metrics = {
-            "mean_error_km": mean_error,
-            "median_error_km": median_error,
-            "MAE": mae,
-            "RMSE": rmse,
-            "errors_km": errors_km,
-            "pred_coords": pred_test,
-            "true_coords": true_test,
-        }
-
-    return metrics
-
+    features = []
+    for component in range(waveform.shape[0]):
+        # Time domain features
+        features.append(np.max(np.abs(waveform[component])))  # Peak amplitude
+        features.append(np.mean(np.abs(waveform[component])))  # Mean amplitude
+        features.append(np.std(waveform[component]))  # Standard deviation
+        
+        # Frequency domain features
+        fft = np.abs(np.fft.rfft(waveform[component]))
+        features.append(np.argmax(fft))  # Dominant frequency index
+        features.append(np.max(fft))  # Maximum frequency amplitude
+        features.append(np.sum(fft))  # Total spectral energy
+        
+        # Add ratios of different frequency bands
+        low_freq = np.sum(fft[:len(fft)//3])
+        mid_freq = np.sum(fft[len(fft)//3:2*len(fft)//3])
+        high_freq = np.sum(fft[2*len(fft)//3:])
+        
+        if low_freq > 0:
+            features.append(high_freq / low_freq)  # High/Low ratio
+        else:
+            features.append(0)
+            
+        if mid_freq > 0:
+            features.append(high_freq / mid_freq)  # High/Mid ratio
+        else:
+            features.append(0)
+        
+    return np.array(features)
 
 def haversine_distance(lat1, lon1, lat2, lon2):
-    """Calculate the great circle distance between two points in kilometers"""
-    R = 6371  # Earth radius in kilometers
-    # Convert to radians
+    """
+    Calculate the Haversine distance between two points in km.
+    """
+    # Convert decimal degrees to radians
     lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
-    dlat = lat2 - lat1
+    
+    # Haversine formula
     dlon = lon2 - lon1
-    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    dlat = lat2 - lat1
+    a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
     c = 2 * np.arcsin(np.sqrt(a))
-    return R * c
+    r = 6371  # Radius of earth in kilometers
+    
+    return c * r
 
-
-def visualize_gnn_results(metrics, ml_df, name="gnn"):
+def calculate_prediction_errors(y_true, y_pred):
     """
-    Visualize GNN prediction results
+    Calculate various error metrics for location predictions.
+    """
+    # Calculate distance errors in km
+    horizontal_errors = np.array([
+        haversine_distance(y_true[i, 0], y_true[i, 1], y_pred[i, 0], y_pred[i, 1]) 
+        for i in range(len(y_true))
+    ])
+    
+    # Depth errors in km
+    depth_errors = np.abs(y_true[:, 2] - y_pred[:, 2])
+    
+    # 3D Euclidean error (approximation)
+    euclidean_3d_errors = np.sqrt(horizontal_errors**2 + depth_errors**2)
+    
+    # Calculate success rates at different thresholds
+    thresholds = [5, 10, 15, 20, 30]
+    success_rates = {}
+    for threshold in thresholds:
+        success_rates[f'horizontal_{threshold}km'] = np.mean(horizontal_errors < threshold) * 100
+        success_rates[f'depth_{threshold}km'] = np.mean(depth_errors < threshold) * 100
+        success_rates[f'3d_{threshold}km'] = np.mean(euclidean_3d_errors < threshold) * 100
+    
+    # Combine all metrics
+    metrics = {
+        'mean_horizontal_error': np.mean(horizontal_errors),
+        'median_horizontal_error': np.median(horizontal_errors),
+        'mean_depth_error': np.mean(depth_errors),
+        'median_depth_error': np.median(depth_errors),
+        'mean_3d_error': np.mean(euclidean_3d_errors),
+        'median_3d_error': np.median(euclidean_3d_errors),
+        **success_rates
+    }
+    
+    return metrics, horizontal_errors, depth_errors, euclidean_3d_errors
 
+def create_spatiotemporal_graphs(df, time_window=24, distance_threshold=50):
+    """
+    Create a list of graph data objects where each node is an aftershock
+    and edges connect aftershocks that are close in space and time.
+    
     Args:
-        metrics: Dictionary of performance metrics
-        ml_df: Original DataFrame with aftershock data
-        name: Name prefix for saving figures
-    """
-    # Extract data
-    pred_coords = metrics["pred_coords"]
-    true_coords = metrics["true_coords"]
-    errors_km = metrics["errors_km"]
-
-    # 1. Error Distribution
-    plt.figure(figsize=(10, 6))
-    plt.hist(errors_km, bins=20)
-    plt.xlabel("Location Error (km)")
-    plt.ylabel("Frequency")
-    plt.title(f"Distribution of Location Prediction Errors (GNN)")
-    plt.axvline(
-        np.median(errors_km),
-        color="r",
-        linestyle="--",
-        label=f"Median Error: {np.median(errors_km):.2f} km",
-    )
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(f"{name}_error_distribution.png")
-    plt.close()
-
-    # 2. Actual vs Predicted Map
-    plt.figure(figsize=(12, 10))
-    plt.scatter(
-        true_coords[:, 1], true_coords[:, 0], c="blue", label="Actual", alpha=0.7, s=50
-    )
-    plt.scatter(
-        pred_coords[:, 1],
-        pred_coords[:, 0],
-        c="red",
-        label="Predicted",
-        alpha=0.5,
-        s=30,
-    )
-
-    # Connect points with lines
-    for i in range(len(true_coords)):
-        plt.plot(
-            [true_coords[i, 1], pred_coords[i, 1]],
-            [true_coords[i, 0], pred_coords[i, 0]],
-            "k-",
-            alpha=0.2,
-        )
-
-    plt.title(
-        f"Actual vs Predicted Locations (GNN)\n"
-        f"Median Error: {np.median(errors_km):.2f} km, Mean Error: {np.mean(errors_km):.2f} km"
-    )
-    plt.xlabel("Longitude")
-    plt.ylabel("Latitude")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-
-    # Add stats in a box
-    props = dict(boxstyle="round", facecolor="white", alpha=0.7)
-    textstr = "\n".join(
-        (
-            f"Total points: {len(true_coords)}",
-            f"Median error: {np.median(errors_km):.2f} km",
-            f"Mean error: {np.mean(errors_km):.2f} km",
-            f"Min error: {min(errors_km):.2f} km",
-            f"Max error: {max(errors_km):.2f} km",
-        )
-    )
-    plt.text(
-        0.05,
-        0.95,
-        textstr,
-        transform=plt.gca().transAxes,
-        fontsize=10,
-        verticalalignment="top",
-        bbox=props,
-    )
-
-    plt.tight_layout()
-    plt.savefig(f"{name}_spatial_prediction.png", dpi=300)
-    plt.close()
-
-    # 3. Training history
-    if "train_loss" in metrics:
-        plt.figure(figsize=(12, 6))
-        plt.subplot(1, 2, 1)
-        plt.plot(metrics["train_loss"], label="Train Loss")
-        plt.plot(
-            range(0, len(metrics["train_loss"]), 10),
-            metrics["val_loss"],
-            label="Val Loss",
-        )
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.title("Training and Validation Loss")
-        plt.legend()
-        plt.grid(True)
-
-        plt.subplot(1, 2, 2)
-        plt.plot(
-            range(0, len(metrics["train_loss"]), 10),
-            metrics["mean_error_km"],
-            label="Mean Error",
-        )
-        plt.plot(
-            range(0, len(metrics["train_loss"]), 10),
-            metrics["median_error_km"],
-            label="Median Error",
-        )
-        plt.xlabel("Epoch")
-        plt.ylabel("Error (km)")
-        plt.title("Error Metrics During Training")
-        plt.legend()
-        plt.grid(True)
-
-        plt.tight_layout()
-        plt.savefig(f"{name}_training_history.png")
-        plt.close()
-
-
-def visualize_graph_structure(graph_data, ml_df, name="aftershock_graph"):
-    """
-    Visualize the structure of the aftershock graph
-
-    Args:
-        graph_data: PyTorch Geometric Data object
-        ml_df: Original DataFrame with aftershock data
-        name: Name prefix for saving figures
-    """
-    try:
-        import networkx as nx
-        from torch_geometric.utils import to_networkx
-
-        # Convert to networkx graph
-        G = to_networkx(graph_data, to_undirected=True)
-
-        # Get node positions from coordinates
-        pos = {}
-        for i in range(len(ml_df)):
-            pos[i] = (ml_df.iloc[i]["longitude"], ml_df.iloc[i]["latitude"])
-
-        # Plot graph with physical coordinates
-        plt.figure(figsize=(12, 10))
-
-        # Color nodes by time
-        time_values = ml_df["hours_since_mainshock"].values
-        node_colors = plt.cm.viridis(
-            (time_values - min(time_values))
-            / (max(time_values) - min(time_values) + 1e-10)
-        )
-
-        # Draw nodes
-        nx.draw_networkx_nodes(G, pos, node_size=50, node_color=node_colors, alpha=0.7)
-
-        # Draw edges with alpha proportional to inverse distance
-        edges = list(G.edges())
-        edge_colors = []
-
-        for u, v in edges:
-            if u == v:  # Skip self-loops for clarity
-                continue
-
-            # Calculate distance for edge color
-            dist = haversine_distance(
-                ml_df.iloc[u]["latitude"],
-                ml_df.iloc[u]["longitude"],
-                ml_df.iloc[v]["latitude"],
-                ml_df.iloc[v]["longitude"],
-            )
-
-            # Normalize distance for color (closer = darker)
-            max_dist = 100  # Maximum expected distance
-            norm_dist = max(0, 1 - dist / max_dist)
-            edge_colors.append(norm_dist)
-
-        # Draw edges
-        nx.draw_networkx_edges(
-            G, pos, width=0.5, alpha=0.3, edge_color=edge_colors, edge_cmap=plt.cm.Blues
-        )
-
-        plt.title("Aftershock Graph Structure\nNodes colored by time since mainshock")
-        plt.colorbar(
-            plt.cm.ScalarMappable(cmap=plt.cm.viridis), label="Hours since mainshock"
-        )
-
-        plt.tight_layout()
-        plt.savefig(f"{name}_structure.png", dpi=300)
-        plt.close()
-
-        # Also visualize edge distribution
-        plt.figure(figsize=(10, 6))
-        degrees = [G.degree(n) for n in G.nodes()]
-        plt.hist(degrees, bins=20)
-        plt.xlabel("Node Degree")
-        plt.ylabel("Frequency")
-        plt.title("Distribution of Node Degrees in Aftershock Graph")
-        plt.grid(True)
-        plt.savefig(f"{name}_degree_distribution.png")
-        plt.close()
-
-    except ImportError:
-        logging.warning(
-            "NetworkX not installed, skipping graph structure visualization"
-        )
-
-
-def gnn_feature_importance(graph_data, model, selected_features):
-    """
-    Estimate feature importance for the GNN model using perturbation
-
-    Args:
-        graph_data: PyTorch Geometric Data object
-        model: Trained GNN model
-        selected_features: List of feature names
-
-    Returns:
-        DataFrame with feature importance scores
-    """
-    model.eval()
-
-    # Get baseline prediction
-    with torch.no_grad():
-        baseline_pred = model(graph_data.x, graph_data.edge_index)
-
-    # For each feature, perturb and measure impact
-    feature_scores = []
-
-    for i in range(graph_data.x.size(1)):
-        # Create perturbed feature matrix
-        x_perturbed = graph_data.x.clone()
-        x_perturbed[:, i] = torch.mean(x_perturbed[:, i])  # Replace with mean
-
-        # Get prediction with perturbed feature
-        with torch.no_grad():
-            perturbed_pred = model(x_perturbed, graph_data.edge_index)
-
-        # Calculate impact
-        impact = torch.mean(torch.abs(baseline_pred - perturbed_pred)).item()
-        feature_scores.append(impact)
-
-    # Normalize scores
-    total_impact = sum(feature_scores)
-    if total_impact > 0:
-        feature_importance = [score / total_impact for score in feature_scores]
-    else:
-        feature_importance = feature_scores
-
-    # Create DataFrame
-    importance_df = pd.DataFrame(
-        {
-            "Feature": selected_features[: len(feature_importance)],
-            "Importance": feature_importance,
-        }
-    ).sort_values("Importance", ascending=False)
-
-    return importance_df
-
-
-def dynamic_graph_construction(ml_df, selected_features, window_size=50, step=10):
-    """
-    Create a dynamic graph representation by sliding a window through the aftershock sequence
-
-    Args:
-        ml_df: DataFrame with aftershock data
-        selected_features: List of features to use for node attributes
-        window_size: Number of aftershocks in each window
-        step: Step size for sliding window
-
+        df: DataFrame with aftershock information
+        time_window: Time window in hours to consider events connected
+        distance_threshold: Distance threshold in km to consider events connected
+    
     Returns:
         List of PyTorch Geometric Data objects
     """
-    # Sort by time
-    ml_df = ml_df.sort_values("hours_since_mainshock").reset_index(drop=True)
+    print("Creating spatiotemporal graphs...")
+    
+    # Convert timestamps to datetime
+    timestamps = pd.to_datetime(df['source_origin_time'])
+    
+    # Sort events by time
+    df_sorted = df.copy()
+    df_sorted['timestamp'] = timestamps
+    df_sorted = df_sorted.sort_values('timestamp')
+    
+    # Calculate temporal differences in hours
+    df_sorted['time_hours'] = (df_sorted['timestamp'] - df_sorted['timestamp'].min()).dt.total_seconds() / 3600
+    
+    # Extract waveform features
+    print("Extracting waveform features for nodes...")
+    waveform_features = np.array([extract_waveform_features(w) for w in tqdm(df_sorted['waveform'])])
+    
+    # Create a dataframe for node features
+    node_df = pd.DataFrame(waveform_features)
+    
+    # Add some additional node features
+    node_df['time_hours'] = df_sorted['time_hours'].values
+    node_df['latitude'] = df_sorted['source_latitude_deg'].values
+    node_df['longitude'] = df_sorted['source_longitude_deg'].values
+    node_df['depth'] = df_sorted['source_depth_km'].values
+    
+    # Scale node features
+    scaler = StandardScaler()
+    node_features = scaler.fit_transform(node_df.values)
+    
+    # Create target values
+    targets = df_sorted[['source_latitude_deg', 'source_longitude_deg', 'source_depth_km']].values
+    
+    # Create spatiotemporal graph data objects
+    graph_data_list = []
+    
+    # We'll create a graph for each event, including its history
+    for i in tqdm(range(1, len(df_sorted))):
+        # Get current event and all previous events
+        current_time = df_sorted['time_hours'].iloc[i]
+        current_lat = df_sorted['source_latitude_deg'].iloc[i]
+        current_lon = df_sorted['source_longitude_deg'].iloc[i]
+        
+        # Past events (including the current one)
+        past_indices = list(range(i+1))  # Include the current event
+        
+        # Filter events within the time window
+        time_indices = [j for j in past_indices if current_time - df_sorted['time_hours'].iloc[j] <= time_window]
+        
+        if len(time_indices) > 1:  # Need at least 2 events to form a graph
+            # Get node features for this subgraph
+            sub_features = node_features[time_indices]
+            sub_targets = targets[time_indices]
+            
+            # Create edges based on spatiotemporal proximity
+            edges = []
+            edge_attrs = []
+            
+            for idx1, j in enumerate(time_indices):
+                j_lat = df_sorted['source_latitude_deg'].iloc[j]
+                j_lon = df_sorted['source_longitude_deg'].iloc[j]
+                j_time = df_sorted['time_hours'].iloc[j]
+                
+                for idx2, k in enumerate(time_indices):
+                    if j != k:  # No self-loops
+                        k_lat = df_sorted['source_latitude_deg'].iloc[k]
+                        k_lon = df_sorted['source_longitude_deg'].iloc[k]
+                        k_time = df_sorted['time_hours'].iloc[k]
+                        
+                        # Calculate spatial distance
+                        spatial_dist = haversine_distance(j_lat, j_lon, k_lat, k_lon)
+                        
+                        # Calculate temporal distance
+                        temporal_dist = abs(j_time - k_time)
+                        
+                        # Add edge if within thresholds
+                        if spatial_dist <= distance_threshold and temporal_dist <= time_window:
+                            edges.append([idx1, idx2])
+                            
+                            # Edge attribute: inverse of distance (closer = stronger connection)
+                            edge_weight = 1.0 / (1.0 + spatial_dist)
+                            time_weight = 1.0 / (1.0 + temporal_dist)
+                            
+                            edge_attrs.append([edge_weight, time_weight])
+            
+            if len(edges) > 0:  # Only create graph if there are edges
+                # Convert to tensor
+                edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+                edge_attr = torch.tensor(edge_attrs, dtype=torch.float)
+                x = torch.tensor(sub_features, dtype=torch.float)
+                y = torch.tensor(sub_targets, dtype=torch.float)
+                
+                # Create PyTorch Geometric data object
+                data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
+                
+                # The target node is always the last one (most recent event)
+                data.num_nodes = len(time_indices)
+                
+                graph_data_list.append(data)
+    
+    print(f"Created {len(graph_data_list)} graphs")
+    return graph_data_list
 
-    # Create list of graphs
-    graphs = []
-    window_starts = range(0, max(0, len(ml_df) - window_size), step)
-
-    for start in window_starts:
-        end = min(start + window_size, len(ml_df))
-        window_df = ml_df.iloc[start:end]
-
-        # Only build graph if we have enough data
-        if len(window_df) >= 5:  # Minimum number of nodes
-            graph, _ = build_aftershock_graph(window_df, selected_features)
-            graphs.append(graph)
-
-    logging.info(f"Created {len(graphs)} dynamic graphs from sliding window")
-    return graphs
-
-
-def main_gnn_pipeline(ml_df, selected_features):
+class GNNModule(torch.nn.Module):
     """
-    Main pipeline for GNN-based aftershock prediction
-
-    Args:
-        ml_df: DataFrame with aftershock data
-        selected_features: List of features to use
-
-    Returns:
-        Trained model and evaluation metrics
+    Graph Neural Network for aftershock prediction
     """
-    # 1. Build graph from aftershock data
-    logging.info("Building aftershock graph...")
-    graph_data, scaler = build_aftershock_graph(ml_df, selected_features)
+    def __init__(self, num_node_features, hidden_dim=64, output_dim=3, num_layers=3, gnn_type='gat'):
+        super(GNNModule, self).__init__()
+        
+        # Select GNN layer type
+        if gnn_type == 'gcn':
+            gnn_layer = GCNConv
+        elif gnn_type == 'graph':
+            gnn_layer = GraphConv
+        elif gnn_type == 'gat':
+            gnn_layer = GATConv
+        elif gnn_type == 'sage':
+            gnn_layer = SAGEConv
+        else:
+            raise ValueError(f"Unknown GNN type: {gnn_type}")
+        
+        # Input layer
+        self.conv1 = gnn_layer(num_node_features, hidden_dim)
+        
+        # Hidden layers
+        self.convs = torch.nn.ModuleList()
+        for i in range(num_layers - 1):
+            self.convs.append(gnn_layer(hidden_dim, hidden_dim))
+        
+        # Output layers
+        self.lin1 = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.lin2 = torch.nn.Linear(hidden_dim, output_dim)
+        
+        # Batch normalization
+        self.bn = torch.nn.BatchNorm1d(hidden_dim)
+        
+        # Dropouts
+        self.dropout = torch.nn.Dropout(0.3)
+        
+    def forward(self, data):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        
+        # If edge attributes are available
+        edge_attr = data.edge_attr if hasattr(data, 'edge_attr') else None
+        
+        # Initial layer
+        if isinstance(self.conv1, SAGEConv):
+            # SAGEConv doesn't use edge_attr
+            x = self.conv1(x, edge_index)
+        elif isinstance(self.conv1, GATConv) or isinstance(self.conv1, GCNConv):
+            x = self.conv1(x, edge_index)
+        else:
+            if edge_attr is not None:
+                x = self.conv1(x, edge_index, edge_attr)
+            else:
+                x = self.conv1(x, edge_index)
+        
+        x = F.relu(x)
+        x = self.dropout(x)
+        
+        # Hidden layers
+        for conv in self.convs:
+            if isinstance(conv, SAGEConv):
+                # SAGEConv doesn't use edge_attr
+                x = conv(x, edge_index)
+            elif isinstance(conv, GATConv) or isinstance(conv, GCNConv):
+                x = conv(x, edge_index)
+            else:
+                if edge_attr is not None:
+                    x = conv(x, edge_index, edge_attr)
+                else:
+                    x = conv(x, edge_index)
+                    
+            x = F.relu(x)
+            x = self.dropout(x)
+        
+        # Apply prediction to each node
+        x = self.bn(x)
+        x = F.relu(self.lin1(x))
+        x = self.dropout(x)
+        x = self.lin2(x)
+        
+        return x
 
-    # 2. Visualize graph structure
-    logging.info("Visualizing graph structure...")
-    visualize_graph_structure(graph_data, ml_df)
+class GNNAftershockPredictor:
+    """
+    Wrapper class for training and evaluating the GNN model
+    """
+    def __init__(self, graph_data_list, gnn_type='gat', hidden_dim=64, num_layers=3, learning_rate=0.001, batch_size=32):
+        self.graph_data_list = graph_data_list
+        self.gnn_type = gnn_type
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+        
+        # Split data into train/val/test
+        self.train_data, self.val_data, self.test_data = self._train_val_test_split()
+        
+        # Setup model
+        num_features = self.graph_data_list[0].x.shape[1]
+        self.model = GNNModule(num_features, hidden_dim, output_dim=3, num_layers=num_layers, gnn_type=gnn_type)
+        
+        # Loss and optimizer
+        self.criterion = nn.MSELoss()
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=1e-5)
+        
+        # Learning rate scheduler
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        )
+        
+        # Setup data loaders
+        self.train_loader = PyGDataLoader(self.train_data, batch_size=batch_size, shuffle=True)
+        self.val_loader = PyGDataLoader(self.val_data, batch_size=batch_size)
+        self.test_loader = PyGDataLoader(self.test_data, batch_size=batch_size)
+        
+    def _train_val_test_split(self, val_ratio=0.15, test_ratio=0.15):
+        """Split graph data into train/val/test sets"""
+        n = len(self.graph_data_list)
+        indices = list(range(n))
+        
+        # Use a deterministic split for reproducibility
+        np.random.seed(42)
+        np.random.shuffle(indices)
+        
+        test_size = int(n * test_ratio)
+        val_size = int(n * val_ratio)
+        
+        test_indices = indices[:test_size]
+        val_indices = indices[test_size:test_size + val_size]
+        train_indices = indices[test_size + val_size:]
+        
+        train_data = [self.graph_data_list[i] for i in train_indices]
+        val_data = [self.graph_data_list[i] for i in val_indices]
+        test_data = [self.graph_data_list[i] for i in test_indices]
+        
+        print(f"Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)} graphs")
+        return train_data, val_data, test_data
+    
+    def train_epoch(self):
+        """Train for one epoch"""
+        self.model.train()
+        epoch_loss = 0
+        
+        for data in self.train_loader:
+            self.optimizer.zero_grad()
+            
+            # Forward pass
+            out = self.model(data)
+            
+            # Get target indices (the most recent event in each graph)
+            target_indices = []
+            offset = 0
+            
+            # In batched mode, PyTorch Geometric combines graphs into a single large graph
+            # with batch information telling us which nodes belong to which graph
+            if hasattr(data, 'batch'):
+                # This is a batched graph
+                batch_size = data.num_graphs
+                ptr = data.ptr.tolist()  # Pointers to where each graph starts
+                
+                for i in range(batch_size):
+                    # Get the number of nodes in this graph
+                    if i < batch_size - 1:
+                        graph_size = ptr[i+1] - ptr[i]
+                    else:
+                        graph_size = data.x.size(0) - ptr[i]
+                    
+                    # Get indices of nodes in this graph
+                    start_idx = ptr[i]
+                    # The target is the last node in each graph (most recent event)
+                    target_idx = start_idx + graph_size - 1
+                    target_indices.append(target_idx)
+            else:
+                # Single graph - target is the last node
+                target_indices.append(data.num_nodes - 1)
+            
+            # Get predictions and targets
+            pred = out[target_indices, :]
+            target = data.y[target_indices, :]
+            
+            # Calculate loss
+            loss = self.criterion(pred, target)
+            
+            # Backward pass
+            loss.backward()
+            self.optimizer.step()
+            
+            epoch_loss += loss.item() * len(target_indices)
+            
+        return epoch_loss / len(self.train_data)
+    
+    def validate(self):
+        """Validate model"""
+        self.model.eval()
+        val_loss = 0
+        
+        with torch.no_grad():
+            for data in self.val_loader:
+                # Forward pass
+                out = self.model(data)
+                
+                # Get target indices
+                target_indices = []
+                
+                # In batched mode, PyTorch Geometric combines graphs into a single large graph
+                # with batch information telling us which nodes belong to which graph
+                if hasattr(data, 'batch'):
+                    # This is a batched graph
+                    batch_size = data.num_graphs
+                    ptr = data.ptr.tolist()  # Pointers to where each graph starts
+                    
+                    for i in range(batch_size):
+                        # Get the number of nodes in this graph
+                        if i < batch_size - 1:
+                            graph_size = ptr[i+1] - ptr[i]
+                        else:
+                            graph_size = data.x.size(0) - ptr[i]
+                        
+                        # Get indices of nodes in this graph
+                        start_idx = ptr[i]
+                        # The target is the last node in each graph (most recent event)
+                        target_idx = start_idx + graph_size - 1
+                        target_indices.append(target_idx)
+                else:
+                    # Single graph - target is the last node
+                    target_indices.append(data.num_nodes - 1)
+                
+                # Get predictions and targets
+                pred = out[target_indices, :]
+                target = data.y[target_indices, :]
+                
+                # Calculate loss
+                loss = self.criterion(pred, target)
+                val_loss += loss.item() * len(target_indices)
+                
+        return val_loss / len(self.val_data)
+    
+    def test(self):
+        """Test model and return predictions"""
+        self.model.eval()
+        test_loss = 0
+        all_preds = []
+        all_targets = []
+        
+        with torch.no_grad():
+            for data in self.test_loader:
+                # Forward pass
+                out = self.model(data)
+                
+                # Get target indices
+                target_indices = []
+                
+                # In batched mode, PyTorch Geometric combines graphs into a single large graph
+                # with batch information telling us which nodes belong to which graph
+                if hasattr(data, 'batch'):
+                    # This is a batched graph
+                    batch_size = data.num_graphs
+                    ptr = data.ptr.tolist()  # Pointers to where each graph starts
+                    
+                    for i in range(batch_size):
+                        # Get the number of nodes in this graph
+                        if i < batch_size - 1:
+                            graph_size = ptr[i+1] - ptr[i]
+                        else:
+                            graph_size = data.x.size(0) - ptr[i]
+                        
+                        # Get indices of nodes in this graph
+                        start_idx = ptr[i]
+                        # The target is the last node in each graph (most recent event)
+                        target_idx = start_idx + graph_size - 1
+                        target_indices.append(target_idx)
+                else:
+                    # Single graph - target is the last node
+                    target_indices.append(data.num_nodes - 1)
+                
+                # Get predictions and targets
+                pred = out[target_indices, :]
+                target = data.y[target_indices, :]
+                
+                # Calculate loss
+                loss = self.criterion(pred, target)
+                test_loss += loss.item() * len(target_indices)
+                
+                # Save predictions and targets
+                all_preds.append(pred.cpu().numpy())
+                all_targets.append(target.cpu().numpy())
+        
+        # Concatenate results
+        y_pred = np.vstack(all_preds)
+        y_true = np.vstack(all_targets)
+        
+        # Calculate errors
+        metrics, horizontal_errors, depth_errors, euclidean_3d_errors = calculate_prediction_errors(y_true, y_pred)
+        
+        return metrics, y_true, y_pred, (horizontal_errors, depth_errors, euclidean_3d_errors)
+    
+    def train(self, num_epochs=100, patience=10):
+        """Train the model with early stopping"""
+        print(f"Training GNN model ({self.gnn_type}) for {num_epochs} epochs...")
+        
+        # Create results directory if it doesn't exist
+        os.makedirs('results', exist_ok=True)
+        
+        # Initialize tracking variables
+        best_val_loss = float('inf')
+        best_epoch = 0
+        no_improve = 0
+        train_losses = []
+        val_losses = []
+        
+        for epoch in range(num_epochs):
+            # Train and validate
+            train_loss = self.train_epoch()
+            val_loss = self.validate()
+            
+            # Store losses
+            train_losses.append(train_loss)
+            val_losses.append(val_loss)
+            
+            # Check for improvement
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_epoch = epoch
+                no_improve = 0
+                
+                # Save best model
+                torch.save(self.model.state_dict(), f"best_gnn_model_{self.gnn_type}.pt")
+            else:
+                no_improve += 1
+            
+            # Update learning rate
+            self.scheduler.step(val_loss)
+            
+            # Print progress
+            print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+            
+            # Early stopping
+            if no_improve >= patience:
+                print(f"Early stopping at epoch {epoch+1}. Best epoch: {best_epoch+1}")
+                break
+        
+        # Load best model
+        self.model.load_state_dict(torch.load(f"best_gnn_model_{self.gnn_type}.pt"))
+        
+        # Plot learning curves
+        plt.figure(figsize=(10, 6))
+        plt.plot(train_losses, label='Train Loss')
+        plt.plot(val_losses, label='Validation Loss')
+        plt.axvline(x=best_epoch, color='r', linestyle='--', label=f'Best Epoch ({best_epoch+1})')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title(f'Training and Validation Loss ({self.gnn_type.upper()})')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(f"results/learning_curve_{self.gnn_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png", 
+                    dpi=300, bbox_inches='tight')
+        
+        return train_losses, val_losses
 
-    # 3. Define and train GNN model
-    input_dim = len(selected_features)
-    logging.info(f"Initializing GNN model with {input_dim} input features...")
-
-    # Try both GCN and GAT models
-    gcn_model = AfterShockGNN(input_dim)
-    gat_model = GATAfterShockModel(input_dim)
-
-    # Train GCN model
-    logging.info("Training GCN model...")
-    trained_gcn, gcn_history = train_gnn_model(graph_data, gcn_model)
-
-    # Train GAT model
-    logging.info("Training GAT model...")
-    trained_gat, gat_history = train_gnn_model(graph_data, gat_model)
-
-    # 4. Evaluate models
-    logging.info("Evaluating GNN models...")
-
-    # Create test mask (last 20% of nodes)
-    num_nodes = graph_data.x.size(0)
-    train_size = int(0.8 * num_nodes)
-    test_mask = torch.zeros(num_nodes, dtype=torch.bool)
-    test_mask[train_size:] = True
-
-    # Evaluate GCN
-    gcn_metrics = evaluate_gnn_model(graph_data, trained_gcn, scaler, test_mask)
-    gcn_metrics.update(gcn_history)  # Add training history
-
-    # Evaluate GAT
-    gat_metrics = evaluate_gnn_model(graph_data, trained_gat, scaler, test_mask)
-    gat_metrics.update(gat_history)  # Add training history
-
-    # 5. Visualize results
-    logging.info("Visualizing results...")
-    visualize_gnn_results(gcn_metrics, ml_df, name="gcn")
-    visualize_gnn_results(gat_metrics, ml_df, name="gat")
-
-    # 6. Analyze feature importance
-    logging.info("Analyzing feature importance...")
-    gcn_importance = gnn_feature_importance(graph_data, trained_gcn, selected_features)
-    gat_importance = gnn_feature_importance(graph_data, trained_gat, selected_features)
-
-    # Plot feature importance
-    plt.figure(figsize=(10, 8))
-    gcn_importance.plot.barh()
-    plt.title("Feature Importance (GCN)")
+def plot_results(y_true, y_pred, errors, model_name="GNN"):
+    """
+    Create visualizations of prediction results.
+    """
+    # Create output directory if it doesn't exist
+    os.makedirs('results', exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    # Plot 1: Map of true vs predicted locations
+    plt.figure(figsize=(12, 10))
+    
+    # Plot true test events
+    plt.scatter(y_true[:, 1], y_true[:, 0], c='blue', s=30, alpha=0.6, label='True')
+    
+    # Plot predicted events
+    plt.scatter(y_pred[:, 1], y_pred[:, 0], c='red', s=30, alpha=0.6, label='Predicted')
+    
+    # Draw lines connecting true and predicted points
+    for i in range(len(y_true)):
+        plt.plot([y_true[i, 1], y_pred[i, 1]], [y_true[i, 0], y_pred[i, 0]], 'k-', alpha=0.15)
+    
+    plt.xlabel('Longitude')
+    plt.ylabel('Latitude')
+    plt.title(f'True vs Predicted Aftershock Locations - {model_name}')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f'results/location_map_{model_name}_{timestamp}.png', dpi=300, bbox_inches='tight')
+    
+    # Plot 2: Error distribution
+    plt.figure(figsize=(15, 10))
+    
+    horizontal_errors, depth_errors, euclidean_3d_errors = errors
+    
+    plt.subplot(2, 2, 1)
+    plt.hist(horizontal_errors, bins=30, color='skyblue', edgecolor='black')
+    plt.axvline(np.mean(horizontal_errors), color='red', linestyle='--', 
+                label=f'Mean: {np.mean(horizontal_errors):.2f} km')
+    plt.axvline(np.median(horizontal_errors), color='green', linestyle='--', 
+                label=f'Median: {np.median(horizontal_errors):.2f} km')
+    plt.xlabel('Horizontal Error (km)')
+    plt.ylabel('Count')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.subplot(2, 2, 2)
+    plt.hist(depth_errors, bins=30, color='lightgreen', edgecolor='black')
+    plt.axvline(np.mean(depth_errors), color='red', linestyle='--', 
+                label=f'Mean: {np.mean(depth_errors):.2f} km')
+    plt.axvline(np.median(depth_errors), color='green', linestyle='--', 
+                label=f'Median: {np.median(depth_errors):.2f} km')
+    plt.xlabel('Depth Error (km)')
+    plt.ylabel('Count')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.subplot(2, 2, 3)
+    plt.hist(euclidean_3d_errors, bins=30, color='salmon', edgecolor='black')
+    plt.axvline(np.mean(euclidean_3d_errors), color='red', linestyle='--', 
+                label=f'Mean: {np.mean(euclidean_3d_errors):.2f} km')
+    plt.axvline(np.median(euclidean_3d_errors), color='green', linestyle='--', 
+                label=f'Median: {np.median(euclidean_3d_errors):.2f} km')
+    plt.xlabel('3D Error (km)')
+    plt.ylabel('Count')
+    plt.legend()
+    plt.grid(True)
+    
     plt.tight_layout()
-    plt.savefig("gcn_feature_importance.png")
-    plt.close()
+    plt.savefig(f'results/error_distribution_{model_name}_{timestamp}.png', dpi=300, bbox_inches='tight')
 
-    plt.figure(figsize=(10, 8))
-    gat_importance.plot.barh()
-    plt.title("Feature Importance (GAT)")
-    plt.tight_layout()
-    plt.savefig("gat_feature_importance.png")
-    plt.close()
-
-    # 7. Return results
-    results = {
-        "gcn_model": trained_gcn,
-        "gat_model": trained_gat,
-        "gcn_metrics": gcn_metrics,
-        "gat_metrics": gat_metrics,
-        "gcn_importance": gcn_importance,
-        "gat_importance": gat_importance,
-        "graph_data": graph_data,
-    }
-
-    return results
-
-
-def modified_main():
-    start_time = datetime.datetime.now()
-
-    logging.info("=== Aftershock Location Prediction Model ===")
-    logging.info(f"Started at: {start_time}")
-    logging.info(f"Python version: {sys.version}")
-    logging.info(f"NumPy version: {np.__version__}")
-    logging.info(f"Pandas version: {pd.__version__}")
-
-    # 1. Load the dataset (limit to 5000 waveforms to keep runtime reasonable)
-    logging.info("\nStep 1: Loading and preprocessing data...")
-    metadata, iquique, waveform_features_dict = load_aftershock_data_with_waveforms(
-        max_waveforms=13400
-    )
-
-    # 2. Identify mainshock and aftershocks
-    logging.info("\nStep 2: Identifying mainshock and aftershocks...")
-    mainshock, aftershocks = identify_mainshock_and_aftershocks(metadata)
-
-    # 3. Consolidate station recordings
-    logging.info("\nStep 3: Consolidating station recordings...")
-    consolidated_metadata, consolidated_features = consolidate_station_recordings(
-        metadata, waveform_features_dict
-    )
-
-    # 3.5. Match event_ids to aftershocks
-    logging.info("\nStep 3.5: Matching event IDs to aftershocks...")
-    # Create key columns in both DataFrames to match events
-    aftershocks["key"] = aftershocks.apply(
-        lambda row: f"{row['source_origin_time']}_{row['source_latitude_deg']:.4f}_{row['source_longitude_deg']:.4f}_{row['source_depth_km']:.1f}",
-        axis=1,
-    )
-    consolidated_metadata["key"] = consolidated_metadata.apply(
-        lambda row: f"{row['source_origin_time']}_{row['lat_rounded']}_{row['lon_rounded']}_{row['depth_rounded']}",
-        axis=1,
-    )
-
-    # Merge event_id into aftershocks
-    aftershocks = aftershocks.merge(
-        consolidated_metadata[["key", "event_id"]], on="key", how="left"
-    )
-
-    # Check if merge was successful
-    missing_ids = aftershocks["event_id"].isna().sum()
-    logging.info(
-        f"Aftershocks without matched event_id: {missing_ids}/{len(aftershocks)}"
-    )
-
-    # Filter to keep only aftershocks with event_id
-    aftershocks = aftershocks[~aftershocks["event_id"].isna()]
-    logging.info(f"Proceeding with {len(aftershocks)} aftershocks that have event_ids")
-
-    # 4. Prepare ML dataset
-    logging.info("\nStep 4: Preparing machine learning dataset...")
-    ml_df = prepare_ml_dataset(aftershocks, consolidated_features)
-    logging.info(f"Dataset shape: {ml_df.shape}")
-
-    # Log some basic statistics about the dataset
-    if len(ml_df) > 0:
-        logging.info("\nDataset statistics:")
-        for col in ["hours_since_mainshock", "distance_from_mainshock_km", "depth_km"]:
-            if col in ml_df.columns:
-                logging.info(
-                    f"  {col}: min={ml_df[col].min():.2f}, max={ml_df[col].max():.2f}, mean={ml_df[col].mean():.2f}"
-                )
-
-        # Count how many events have each feature
-        feature_counts = {
-            col: ml_df[col].count()
-            for col in ml_df.columns
-            if col not in ["latitude", "longitude"]
-        }
-        logging.info("\nFeature availability counts:")
-        for feature, count in sorted(
-            feature_counts.items(), key=lambda x: x[1], reverse=True
-        ):
-            if count < len(ml_df):
-                logging.info(
-                    f"  {feature}: {count}/{len(ml_df)} ({count/len(ml_df)*100:.1f}%)"
-                )
-    else:
-        logging.error("Empty dataset! Cannot proceed with training.")
+def main():
+    """
+    Main function to run the GNN aftershock prediction pipeline.
+    """
+    print("Starting GNN Aftershock Prediction...")
+    
+    # Check if data exists
+    if not os.path.exists("aftershock_data.pkl"):
+        print("Error: Data file 'aftershock_data.pkl' not found.")
         return
-
-    # 5. Engineer features
-    logging.info("\nStep 5: Engineering features...")
-    ml_df = safe_engineer_features(ml_df)
-    logging.info(f"Dataset shape after feature engineering: {ml_df.shape}")
-    # Your existing code for data loading and preprocessing
-    # ...
-
-    # 6. Define and select features
-    selected_features = [
-        # Your chosen features here
-        "N_spec_dom_freq_std",
-        "S_Z_LH_ratio",
-        "S_E_LH_ratio",
-        "log_hours",
-        "hours_since_mainshock",
-        "N_PS_ratio",
-        "Z_energy_ratio",
-        "Z_wavelet_band_ratio_0_1",
-        "Z_spec_dom_freq_std",
-        "Z_low_freq_decay_rate",
-        "N_energy_ratio",
-        "Z_PS_ratio",
-        "P_E_LH_ratio",
-        "day_number",
-        "P_linearity",
-        "depth_km",
-        "depth_rolling_avg",
-    ]
-    # Ensure only available features are used
-    selected_features = [feat for feat in selected_features if feat in ml_df.columns]
-    logging.info(f"Selected {len(selected_features)} features for prediction.")
-
-    # Build ml_df and selected_features as in your original code
-    # ...
-
-    try:
-        # Run GNN pipeline
-        gnn_results = main_gnn_pipeline(ml_df, selected_features)
-
-        # Log results
-        logging.info("\nGNN Model Results:")
-        logging.info(
-            f"GCN Median Error: {gnn_results['gcn_metrics']['median_error_km']:.2f} km"
+    
+    # Read data
+    print("Reading data from pickle file...")
+    df = read_data_from_pickle("aftershock_data.pkl")
+    
+    # Display data info
+    print(f"Dataset loaded. Total events: {len(df)}")
+    
+    # Create spatiotemporal graphs
+    graph_data_list = create_spatiotemporal_graphs(df, time_window=48, distance_threshold=75)
+    
+    # Set device (GPU if available)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Train models with different GNN types
+    gnn_types = ['gat', 'gcn', 'sage']
+    results = {}
+    
+    for gnn_type in gnn_types:
+        print(f"\n===== Training {gnn_type.upper()} model =====")
+        
+        # Initialize GNN predictor
+        predictor = GNNAftershockPredictor(
+            graph_data_list=graph_data_list,
+            gnn_type=gnn_type,
+            hidden_dim=128,
+            num_layers=4,
+            learning_rate=0.001,
+            batch_size=16
         )
-        logging.info(
-            f"GAT Median Error: {gnn_results['gat_metrics']['median_error_km']:.2f} km"
-        )
-
-        # Compare with traditional models
-        traditional_results = compare_models(ml_df, selected_features)
-
-        # Create comparison table with both traditional and GNN models
-        all_results = {**traditional_results}  # Start with traditional results
-        all_results["GCN"] = {
-            "median_error_km": gnn_results["gcn_metrics"]["median_error_km"],
-            "mean_error_km": gnn_results["gcn_metrics"]["mean_error_km"],
-            "MAE": gnn_results["gcn_metrics"]["MAE"],
-            "RMSE": gnn_results["gcn_metrics"]["RMSE"],
+        
+        # Train model
+        predictor.train(num_epochs=150, patience=15)
+        
+        # Evaluate on test set
+        print(f"Evaluating {gnn_type.upper()} model on test set...")
+        metrics, y_true, y_pred, errors = predictor.test()
+        
+        # Print metrics
+        print(f"\n{gnn_type.upper()} Prediction Error Metrics:")
+        for key, value in metrics.items():
+            print(f"{key}: {value:.4f}")
+        
+        # Plot results
+        plot_results(y_true, y_pred, errors, model_name=f"GNN_{gnn_type.upper()}")
+        
+        # Store results
+        results[gnn_type] = {
+            'metrics': metrics,
+            'y_true': y_true,
+            'y_pred': y_pred,
+            'errors': errors
         }
-        all_results["GAT"] = {
-            "median_error_km": gnn_results["gat_metrics"]["median_error_km"],
-            "mean_error_km": gnn_results["gat_metrics"]["mean_error_km"],
-            "MAE": gnn_results["gat_metrics"]["MAE"],
-            "RMSE": gnn_results["gat_metrics"]["RMSE"],
-        }
-
-        # Visualize comparison
-        visualize_model_comparison(all_results)
-
-    except Exception as e:
-        logging.error(f"Error in GNN pipeline: {e}")
-        import traceback
-
-        logging.error(traceback.format_exc())
-
+    
+    # Compare different GNN models
+    plt.figure(figsize=(12, 8))
+    
+    metrics_to_plot = ['mean_horizontal_error', 'mean_depth_error', 'mean_3d_error']
+    x = np.arange(len(metrics_to_plot))
+    width = 0.2
+    
+    for i, gnn_type in enumerate(gnn_types):
+        values = [results[gnn_type]['metrics'][m] for m in metrics_to_plot]
+        plt.bar(x + i*width, values, width, label=gnn_type.upper())
+    
+    plt.xlabel('Metric')
+    plt.ylabel('Error (km)')
+    plt.title('Comparison of Different GNN Models')
+    plt.xticks(x + width, metrics_to_plot)
+    plt.legend()
+    plt.grid(True, axis='y')
+    plt.savefig(f'results/gnn_comparison_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png', 
+                dpi=300, bbox_inches='tight')
+    
+    print("GNN prediction complete. Results saved in the 'results' directory.")
 
 if __name__ == "__main__":
-    modified_main()
+    start_time = time.time()
+    main()
+    elapsed_time = time.time() - start_time
+    print(f"Total execution time: {elapsed_time:.2f} seconds")
