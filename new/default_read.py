@@ -8,73 +8,77 @@ from scipy import signal
 def load_aftershock_data_with_waveforms(max_waveforms):
     """
     Load and preprocess aftershock data from the Iquique dataset,
-    including waveform data
+    including waveform data, and add the waveform components before dropping duplicates.
     """
     print("Loading Iquique dataset using SeisBench...")
     iquique = sbd.Iquique()
 
-    # Get metadata
+    # Get metadata and preserve original indices for waveform extraction.
     metadata = iquique.metadata.copy()
+    # (Optionally, store the original index if needed later)
+    metadata["orig_idx"] = metadata.index
 
-    # Filter out rows with missing essential data
-    metadata = metadata.dropna(
-        subset=[
-            "source_origin_time",
-            "source_latitude_deg",
-            "source_longitude_deg",
-            "source_depth_km",
-        ]
-    )
+    # Define the columns that uniquely identify an event.
 
-    # Convert timestamps
+    # All metadata columns are:
+    # source_origin_time,source_latitude_deg,source_longitude_deg,source_depth_km,
+    # path_back_azimuth_deg,station_network_code,station_code,trace_channel,station_location_code,
+    # station_latitude_deg,station_longitude_deg,station_elevation_m,trace_name,trace_sampling_rate_hz,
+    # trace_completeness,trace_has_spikes,trace_start_time,trace_P_arrival_sample,trace_S_arrival_sample,
+    # trace_name_original,trace_chunk,trace_component_order,split
+    unique_event_columns = [
+        "source_origin_time",
+        "source_latitude_deg",
+        "source_longitude_deg",
+        "source_depth_km",
+    ]
+
+    # Filter out rows with missing essential data.
+    metadata = metadata.dropna(subset=unique_event_columns)
+
+    # Optional: sort by datetime for a consistent ordering.
     metadata["datetime"] = pd.to_datetime(metadata["source_origin_time"])
-
-    # Sort by time
     metadata = metadata.sort_values("datetime")
 
-    # Create a dictionary to store waveform features
-    waveform_features_dict = {}
+    # Limit to process only a subset, if desired.
+    metadata = metadata.iloc[: min(max_waveforms, len(metadata))].copy()
 
-    # Initialize feature extractor
-    feature_extractor = WaveformFeatureExtractor()
+    print(f"Extracting waveform features for {len(metadata)} events...")
 
-    # Limit the number of waveforms to process
-    sample_indices = metadata.index[: min(max_waveforms, len(metadata))]
-
-    print(f"Extracting waveform features for {len(sample_indices)} events...")
-    for idx in tqdm(sample_indices):
+    # Create an empty list to store waveform data for each row.
+    waveforms = []
+    # Extract waveforms row by row and add them to the list.
+    for idx in tqdm(metadata.index):
         try:
-            # Get waveform data
-            waveform = iquique.get_waveforms(int(idx))
+            # Use the original index (or current index if they match) to retrieve waveforms.
+            waveform = iquique.get_waveforms(int(metadata.loc[idx, "orig_idx"]))
 
-            # Get P and S arrival samples if available
-            p_arrival = metadata.loc[idx, "trace_P_arrival_sample"]
-            s_arrival = metadata.loc[idx, "trace_S_arrival_sample"]
+            # Example output of get_waveforms(idx):
+            # The array contains waveform recordings from a single seismic station.
+            # Output component order not specified, defaulting to 'ZNE'.
+            # [[-193.04892508 -196.04892508 -175.04892508 ...  314.95107492
+            # 316.95107492  352.95107492]
+            # [ 112.44318263  121.44318263  117.44318263 ...  195.44318263
+            # 167.44318263  106.44318263]
+            # [  -4.07892293    1.92107707    2.92107707 ...  154.92107707
+            # 191.92107707  206.92107707]]
 
-            # Validate P and S arrivals
-            if pd.isna(p_arrival) or pd.isna(s_arrival):
-                p_arrival, s_arrival = None, None
-            else:
-                p_arrival = int(p_arrival)
-                s_arrival = int(s_arrival)
-
-            # Extract features
-            features = feature_extractor.extract_features(
-                waveform, p_arrival, s_arrival
-            )
-
-            # Store features
-            waveform_features_dict[idx] = features
-
+            waveforms.append(waveform)
         except Exception as e:
-            print(f"Error processing waveform {idx}: {e}")
-            waveform_features_dict[idx] = {}
+            print(f"Error processing waveform for row {idx}: {e}")
+            waveforms.append(None)
 
-    print(
-        f"Successfully extracted features for {len(waveform_features_dict)} waveforms"
+    # Add waveform data as a new column.
+    metadata["waveform"] = waveforms
+
+    # Now drop duplicates based on unique event columns;
+    # Note that this will drop duplicate events, retaining the first occurrence (and its waveform data).
+    unique_metadata = metadata.drop_duplicates(subset=unique_event_columns).reset_index(
+        drop=True
     )
 
-    return metadata, iquique, waveform_features_dict
+    print(f"Total unique events in dataset: {len(unique_metadata)}")
+    return unique_metadata, iquique
 
 
 def identify_mainshock_and_aftershocks(metadata):
@@ -179,239 +183,6 @@ def identify_mainshock_and_aftershocks(metadata):
     return mainshock, aftershocks
 
 
-def consolidate_station_recordings(metadata, waveform_features_dict):
-    """
-    Consolidate multiple station recordings of the same event into a single representation
-    as there are 134000 recordings for 410 events
-    """
-    # Create event IDs based on source parameters
-    metadata["lat_rounded"] = np.round(metadata["source_latitude_deg"], 4)
-    metadata["lon_rounded"] = np.round(metadata["source_longitude_deg"], 4)
-    metadata["depth_rounded"] = np.round(metadata["source_depth_km"], 1)
-
-    metadata["event_id"] = metadata.groupby(
-        ["source_origin_time", "lat_rounded", "lon_rounded", "depth_rounded"]
-    ).ngroup()
-
-    print(
-        f"Original recordings: {len(metadata)}, Unique events: {metadata['event_id'].nunique()}"
-    )
-
-    # Create consolidated representations
-    consolidated_metadata = []
-    consolidated_features = {}
-
-    # Track how many events actually have features
-    events_with_features = 0
-
-    for event_id, group in metadata.groupby("event_id"):
-        # Find recordings with valid waveform features
-        valid_recordings = []
-        for idx in group.index:
-            if idx in waveform_features_dict and waveform_features_dict[idx]:
-                valid_recordings.append(idx)
-
-        # If we have recordings with features, use one of them
-        if valid_recordings:
-            best_idx = valid_recordings[0]  # Just take the first valid one
-            events_with_features += 1
-        else:
-            # If no recording has features, just take the first index
-            best_idx = group.index[0]
-
-        # Take metadata from best recording
-        best_record = group.loc[best_idx].copy()
-        best_record["station_count"] = len(group)
-        best_record["event_id"] = event_id  # Keep event_id in the metadata
-        consolidated_metadata.append(best_record)
-
-        # Map waveform features to the event_id
-        if best_idx in waveform_features_dict and waveform_features_dict[best_idx]:
-            consolidated_features[event_id] = waveform_features_dict[best_idx]
-
-    print(f"Events with valid waveform features: {events_with_features}")
-
-    # Convert to DataFrame
-    consolidated_metadata = pd.DataFrame(consolidated_metadata)
-    return consolidated_metadata, consolidated_features
-
-
-class WaveformFeatureExtractor:
-    """
-    Class to extract features from seismic waveforms
-    """
-
-    def __init__(self, sampling_rate=100.0):
-        self.sampling_rate = sampling_rate
-
-    def extract_features(self, waveform, p_arrival=None, s_arrival=None):
-        """
-        Extract features from waveform data
-
-        Parameters:
-        -----------
-        waveform : numpy.ndarray
-            Waveform data with shape (num_components, num_samples)
-        p_arrival : int, optional
-            P-wave arrival sample
-        s_arrival : int, optional
-            S-wave arrival sample
-
-        Returns:
-        --------
-        features : dict
-            Dictionary of extracted features
-        """
-        # Initialize feature dictionary
-        features = {}
-
-        # Basic time-domain features (overall signal)
-        for i, component_name in enumerate(["Z", "N", "E"]):
-            if i < waveform.shape[0]:  # Check if component exists
-                component = waveform[i]
-
-                # Calculate basic statistics
-                features[f"{component_name}_max"] = np.max(np.abs(component))
-                features[f"{component_name}_mean"] = np.mean(np.abs(component))
-                features[f"{component_name}_std"] = np.std(component)
-                features[f"{component_name}_rms"] = np.sqrt(np.mean(component**2))
-                features[f"{component_name}_energy"] = np.sum(component**2)
-                features[f"{component_name}_kurtosis"] = self._kurtosis(component)
-
-                # Calculate frequency-domain features
-                freq_features = self._compute_frequency_features(component)
-                for feat_name, feat_value in freq_features.items():
-                    features[f"{component_name}_{feat_name}"] = feat_value
-
-        # Extract P-wave and S-wave specific features if arrivals are provided
-        if p_arrival is not None and s_arrival is not None:
-            p_window_size = 100  # 100 samples after P arrival
-            s_window_size = 100  # 100 samples after S arrival
-
-            # Ensure window sizes don't exceed waveform length
-            p_window_size = min(p_window_size, waveform.shape[1] - p_arrival)
-            s_window_size = min(s_window_size, waveform.shape[1] - s_arrival)
-
-            if p_window_size > 0:
-                for i, component_name in enumerate(["Z", "N", "E"]):
-                    if i < waveform.shape[0]:  # Check if component exists
-                        p_segment = waveform[i, p_arrival : p_arrival + p_window_size]
-
-                        # Calculate P-wave features
-                        features[f"P_{component_name}_max"] = np.max(np.abs(p_segment))
-                        features[f"P_{component_name}_mean"] = np.mean(
-                            np.abs(p_segment)
-                        )
-                        features[f"P_{component_name}_std"] = np.std(p_segment)
-                        features[f"P_{component_name}_energy"] = np.sum(p_segment**2)
-
-                        # P-wave frequency features
-                        p_freq_features = self._compute_frequency_features(p_segment)
-                        for feat_name, feat_value in p_freq_features.items():
-                            features[f"P_{component_name}_{feat_name}"] = feat_value
-
-            if s_window_size > 0:
-                for i, component_name in enumerate(["Z", "N", "E"]):
-                    if i < waveform.shape[0]:  # Check if component exists
-                        s_segment = waveform[i, s_arrival : s_arrival + s_window_size]
-
-                        # Calculate S-wave features
-                        features[f"S_{component_name}_max"] = np.max(np.abs(s_segment))
-                        features[f"S_{component_name}_mean"] = np.mean(
-                            np.abs(s_segment)
-                        )
-                        features[f"S_{component_name}_std"] = np.std(s_segment)
-                        features[f"S_{component_name}_energy"] = np.sum(s_segment**2)
-
-                        # S-wave frequency features
-                        s_freq_features = self._compute_frequency_features(s_segment)
-                        for feat_name, feat_value in s_freq_features.items():
-                            features[f"S_{component_name}_{feat_name}"] = feat_value
-
-            # Calculate P/S amplitude ratios for each component
-            for i, component_name in enumerate(["Z", "N", "E"]):
-                if i < waveform.shape[0]:  # Check if component exists
-                    if (
-                        features.get(f"P_{component_name}_max", 0) > 0
-                        and features.get(f"S_{component_name}_max", 0) > 0
-                    ):
-                        features[f"{component_name}_PS_ratio"] = (
-                            features[f"P_{component_name}_max"]
-                            / features[f"S_{component_name}_max"]
-                        )
-
-        return features
-
-    def _compute_frequency_features(self, signal_segment):
-        """
-        Compute frequency domain features
-        """
-        features = {}
-
-        # Check if signal segment is not empty
-        if len(signal_segment) < 10:
-            return {
-                "dominant_freq": 0,
-                "low_freq_energy": 0,
-                "mid_freq_energy": 0,
-                "high_freq_energy": 0,
-                "low_high_ratio": 0,
-            }
-
-        try:
-            # Calculate power spectral density
-            f, Pxx = signal.welch(
-                signal_segment,
-                fs=self.sampling_rate,
-                nperseg=min(256, len(signal_segment)),
-            )
-
-            # Dominant frequency
-            features["dominant_freq"] = f[np.argmax(Pxx)]
-
-            # Frequency band energies
-            low_idx = f < 5
-            mid_idx = (f >= 5) & (f < 15)
-            high_idx = f >= 15
-
-            # Handle empty frequency bands
-            features["low_freq_energy"] = np.sum(Pxx[low_idx]) if np.any(low_idx) else 0
-            features["mid_freq_energy"] = np.sum(Pxx[mid_idx]) if np.any(mid_idx) else 0
-            features["high_freq_energy"] = (
-                np.sum(Pxx[high_idx]) if np.any(high_idx) else 0
-            )
-
-            # Calculate frequency ratios
-            if features["high_freq_energy"] > 0:
-                features["low_high_ratio"] = (
-                    features["low_freq_energy"] / features["high_freq_energy"]
-                )
-            else:
-                features["low_high_ratio"] = 0
-
-        except Exception as e:
-            print(f"Error computing frequency features: {e}")
-            features = {
-                "dominant_freq": 0,
-                "low_freq_energy": 0,
-                "mid_freq_energy": 0,
-                "high_freq_energy": 0,
-                "low_high_ratio": 0,
-            }
-
-        return features
-
-    def _kurtosis(self, x):
-        """Calculate kurtosis of a signal"""
-        n = len(x)
-        if n < 4:
-            return 0
-
-        mean = np.mean(x)
-        std = np.std(x)
-
-        if std == 0:
-            return 0
-
-        kurt = np.mean(((x - mean) / std) ** 4) - 3
-        return kurt
+if __name__ == "__main__":
+    # Load the Iquique dataset and preprocess
+    metadata, iquique = load_aftershock_data_with_waveforms(max_waveforms=13400)

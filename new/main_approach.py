@@ -939,21 +939,63 @@ def train_location_prediction_model_holdout(ml_df):
     # Make sure none of these features include target data or are computed
     # using future values (we modified the rolling functions above).
     selected_features = [
-        "N_spec_dom_freq_std",
-        "S_Z_LH_ratio",
-        "S_E_LH_ratio",
-        "log_hours",
-        "hours_since_mainshock",
-        "N_PS_ratio",
-        "Z_energy_ratio",
-        "Z_wavelet_band_ratio_0_1",
-        "Z_spec_dom_freq_std",
-        "Z_low_freq_decay_rate",
-        "N_energy_ratio",
+        # Original features
+        "Z_energy",
+        "N_energy",
+        "E_energy",
+        "Z_dominant_freq",
+        "N_dominant_freq",
+        "E_dominant_freq",
         "Z_PS_ratio",
-        "P_E_LH_ratio",
+        "N_PS_ratio",
+        "E_PS_ratio",
+        "P_Z_energy",
+        "P_N_energy",
+        "P_E_energy",
+        "S_Z_energy",
+        "S_N_energy",
+        "S_E_energy",
+        "hours_since_mainshock",
+        "log_hours",
         "day_number",
+        "hours_since_last",
+        "Z_energy_ratio",
+        "N_energy_ratio",
+        "E_energy_ratio",
+        # New wavelet features
+        "Z_wavelet_band_0_energy",
+        "N_wavelet_band_0_energy",
+        "E_wavelet_band_0_energy",
+        "Z_wavelet_band_ratio_0_1",
+        "N_wavelet_band_ratio_0_1",
+        "E_wavelet_band_ratio_0_1",
+        # New spectrogram features
+        "Z_spec_dom_freq_std",
+        "N_spec_dom_freq_std",
+        "E_spec_dom_freq_std",
+        "Z_low_freq_decay_rate",
+        "N_low_freq_decay_rate",
+        "E_low_freq_decay_rate",
+        # New polarization features
         "P_linearity",
+        "P_planarity",
+        "S_linearity",
+        "S_planarity",
+        # New phase-specific features
+        "P_Z_dom_freq",
+        "P_N_dom_freq",
+        "P_E_dom_freq",
+        "S_Z_dom_freq",
+        "S_N_dom_freq",
+        "S_E_dom_freq",
+        "P_Z_LH_ratio",
+        "P_N_LH_ratio",
+        "P_E_LH_ratio",
+        "S_Z_LH_ratio",
+        "S_N_LH_ratio",
+        "S_E_LH_ratio",
+        # "depth_km",
+        # "depth_rolling_avg"
     ]
     # Ensure only available features are used
     selected_features = [feat for feat in selected_features if feat in ml_df.columns]
@@ -1568,6 +1610,108 @@ def visualize_model_comparison(results):
         print(f"{model:<20} " + " ".join([f"{v:>15}" for v in values]))
 
 
+def match_aftershocks_to_events(
+    aftershocks, consolidated_metadata, distance_threshold=2.0
+):
+    """
+    Match aftershocks to events in consolidated metadata using a more robust approach.
+
+    Args:
+        aftershocks: DataFrame containing aftershock data
+        consolidated_metadata: DataFrame containing consolidated event data with event_ids
+        distance_threshold: Maximum distance in km to consider events as matching
+
+    Returns:
+        DataFrame with matched event_ids added to aftershocks
+    """
+    import numpy as np
+    import pandas as pd
+    from datetime import timedelta
+    import logging
+
+    logging.info("\nMatching aftershocks to events using improved method...")
+
+    # Create a copy of the aftershocks DataFrame
+    matched_aftershocks = aftershocks.copy()
+
+    # Initialize event_id column
+    matched_aftershocks["event_id"] = np.nan
+
+    # Count of successful matches
+    match_count = 0
+
+    # Convert timestamps to datetime objects if they aren't already
+    if not isinstance(aftershocks["datetime"].iloc[0], pd.Timestamp):
+        aftershocks["datetime"] = pd.to_datetime(aftershocks["datetime"])
+    if not isinstance(consolidated_metadata["datetime"].iloc[0], pd.Timestamp):
+        consolidated_metadata["datetime"] = pd.to_datetime(
+            consolidated_metadata["datetime"]
+        )
+
+    # Time threshold for matching (e.g., 1 second)
+    time_threshold = timedelta(seconds=1)
+
+    # For each aftershock, find the best matching event
+    for i, aftershock in enumerate(aftershocks.itertuples()):
+        # Filter potential matches by time first (for efficiency)
+        time_matches = consolidated_metadata[
+            (consolidated_metadata["datetime"] >= aftershock.datetime - time_threshold)
+            & (
+                consolidated_metadata["datetime"]
+                <= aftershock.datetime + time_threshold
+            )
+        ]
+
+        if len(time_matches) == 0:
+            continue
+
+        # For time matches, calculate spatial distance
+        distances = []
+        for event in time_matches.itertuples():
+            dist = haversine_distance(
+                aftershock.source_latitude_deg,
+                aftershock.source_longitude_deg,
+                event.source_latitude_deg,
+                event.source_longitude_deg,
+            )
+            distances.append((event.event_id, dist))
+
+        # Find the closest event within threshold
+        closest_matches = [
+            (event_id, dist)
+            for event_id, dist in distances
+            if dist <= distance_threshold
+        ]
+
+        if closest_matches:
+            # Sort by distance and take the closest
+            closest_matches.sort(key=lambda x: x[1])
+            best_match_id, best_match_dist = closest_matches[0]
+
+            # Assign the event_id
+            matched_aftershocks.loc[aftershock.Index, "event_id"] = best_match_id
+            match_count += 1
+
+        # Provide progress updates
+        if (i + 1) % 1000 == 0:
+            logging.info(
+                f"  Processed {i+1}/{len(aftershocks)} aftershocks, found {match_count} matches so far"
+            )
+
+    # Log final results
+    missing_ids = matched_aftershocks["event_id"].isna().sum()
+    match_percentage = (match_count / len(aftershocks)) * 100
+
+    logging.info(
+        f"Matching complete: Found {match_count}/{len(aftershocks)} matches ({match_percentage:.2f}%)"
+    )
+    logging.info(
+        f"Aftershocks without matched event_id: {missing_ids}/{len(aftershocks)}"
+    )
+
+    return matched_aftershocks
+
+
 def main():
     """Main execution function"""
     start_time = datetime.datetime.now()
@@ -1598,18 +1742,8 @@ def main():
     # 3.5. Match event_ids to aftershocks
     logging.info("\nStep 3.5: Matching event IDs to aftershocks...")
     # Create key columns in both DataFrames to match events
-    aftershocks["key"] = aftershocks.apply(
-        lambda row: f"{row['source_origin_time']}_{row['source_latitude_deg']:.4f}_{row['source_longitude_deg']:.4f}_{row['source_depth_km']:.1f}",
-        axis=1,
-    )
-    consolidated_metadata["key"] = consolidated_metadata.apply(
-        lambda row: f"{row['source_origin_time']}_{row['lat_rounded']}_{row['lon_rounded']}_{row['depth_rounded']}",
-        axis=1,
-    )
-
-    # Merge event_id into aftershocks
-    aftershocks = aftershocks.merge(
-        consolidated_metadata[["key", "event_id"]], on="key", how="left"
+    aftershocks = match_aftershocks_to_events(
+        aftershocks, consolidated_metadata, distance_threshold=2.0
     )
 
     # Check if merge was successful
@@ -1683,6 +1817,8 @@ def main():
         "P_E_LH_ratio",
         "day_number",
         "P_linearity",
+        # "depth_km",
+        # "depth_rolling_avg",
     ]
     # Ensure only available features are used
     selected_features = [feat for feat in selected_features if feat in ml_df.columns]
