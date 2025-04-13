@@ -14,7 +14,7 @@ from datetime import datetime
 from sklearn.model_selection import train_test_split
 from torch_geometric.loader import DataLoader
 import torch.nn.functional as F
-from debug import *
+from new.debug import *
 
 
 # Parse arguments with added options for improved training
