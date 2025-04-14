@@ -72,4 +72,4 @@ def read_data_from_pickle(file_path):
 
 if __name__ == "__main__":
     # Load the Iquique dataset and preprocess
-    data = read_data_from_pickle("aftershock_data.pkl")
+    data, iq = load_aftershock_data_with_waveforms(13401)
