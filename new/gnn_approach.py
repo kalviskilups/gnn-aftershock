@@ -78,6 +78,110 @@ def haversine_loss(y_pred, y_true):
     return torch.mean(dist_3d)
 
 
+def debug_graph_structure(graph_data_list, num_samples=3):
+    """
+    Debug and visualize the created graph structure.
+    
+    Args:
+        graph_data_list: List of PyTorch Geometric Data objects
+        num_samples: Number of sample graphs to analyze
+    """
+    import networkx as nx
+    import matplotlib.pyplot as plt
+    from torch_geometric.utils import to_networkx
+    
+    print(f"\n===== Debugging Graph Structure =====")
+    
+    # Overall statistics
+    num_graphs = len(graph_data_list)
+    nodes_per_graph = [g.num_nodes for g in graph_data_list]
+    edges_per_graph = [g.edge_index.shape[1] for g in graph_data_list]
+    
+    print(f"Total graphs: {num_graphs}")
+    print(f"Nodes per graph: min={min(nodes_per_graph)}, max={max(nodes_per_graph)}, avg={sum(nodes_per_graph)/num_graphs:.2f}")
+    print(f"Edges per graph: min={min(edges_per_graph)}, max={max(edges_per_graph)}, avg={sum(edges_per_graph)/num_graphs:.2f}")
+    
+    # Checking for isolated nodes
+    isolated_nodes = []
+    for i, g in enumerate(graph_data_list):
+        edge_set = set(g.edge_index[0].tolist() + g.edge_index[1].tolist())
+        all_nodes = set(range(g.num_nodes))
+        isolated = all_nodes - edge_set
+        if isolated:
+            isolated_nodes.append((i, isolated))
+    
+    print(f"Graphs with isolated nodes: {len(isolated_nodes)}/{num_graphs}")
+    
+    # Examining graph connectivity
+    for i, g in enumerate(graph_data_list[:num_samples]):
+        print(f"\nGraph {i} details:")
+        print(f"  Number of nodes: {g.num_nodes}")
+        print(f"  Number of edges: {g.edge_index.shape[1]}")
+        print(f"  Node feature dimensions: {g.x.shape}")
+        print(f"  Edge attribute dimensions: {g.edge_attr.shape if hasattr(g, 'edge_attr') else 'None'}")
+        
+        # Check target node
+        target_idx = g.num_nodes - 1  # Last node is target
+        target_node_connections = 0
+        for j in range(g.edge_index.shape[1]):
+            if g.edge_index[0, j].item() == target_idx or g.edge_index[1, j].item() == target_idx:
+                target_node_connections += 1
+        
+        print(f"  Target node (idx {target_idx}) has {target_node_connections} connections")
+        
+        # Visualize graph
+        plt.figure(figsize=(10, 8))
+        G = to_networkx(g, to_undirected=True)
+        pos = nx.spring_layout(G, seed=42)  # For consistent layout
+        
+        # Get node colors (target node highlighted)
+        node_colors = ['red' if n == target_idx else 'skyblue' for n in G.nodes()]
+        
+        # Draw the graph
+        nx.draw(G, pos, with_labels=True, node_color=node_colors, 
+                node_size=500, font_size=10, font_weight='bold')
+        plt.title(f"Graph {i} Structure")
+        plt.savefig(f"results/graph_structure_{i}.png", dpi=300, bbox_inches="tight")
+        plt.close()
+    
+    # Check for potential issues
+    potential_issues = []
+    
+    # 1. Check for very small graphs
+    small_graphs = sum(1 for n in nodes_per_graph if n < 3)
+    if small_graphs > 0:
+        potential_issues.append(f"Found {small_graphs} graphs with fewer than 3 nodes")
+    
+    # 2. Check for very sparse graphs
+    sparse_graphs = sum(1 for i, g in enumerate(graph_data_list) 
+                      if g.edge_index.shape[1] < g.num_nodes * 0.5)
+    if sparse_graphs > num_graphs * 0.3:  # If more than 30% of graphs are sparse
+        potential_issues.append(f"Found {sparse_graphs} sparse graphs (low edge density)")
+    
+    # 3. Check for disconnected target nodes
+    disconnected_targets = 0
+    for g in graph_data_list:
+        target_idx = g.num_nodes - 1
+        connected = False
+        for j in range(g.edge_index.shape[1]):
+            if g.edge_index[0, j].item() == target_idx or g.edge_index[1, j].item() == target_idx:
+                connected = True
+                break
+        if not connected:
+            disconnected_targets += 1
+    
+    if disconnected_targets > 0:
+        potential_issues.append(f"Found {disconnected_targets} graphs with disconnected target nodes")
+    
+    # Print potential issues
+    if potential_issues:
+        print("\nPotential issues detected:")
+        for issue in potential_issues:
+            print(f"- {issue}")
+    else:
+        print("\nNo obvious structural issues detected in the graphs")
+
+
 def extract_waveform_features(waveform):
     """
     Extract enhanced features from a seismic waveform.
@@ -202,7 +306,7 @@ def calculate_prediction_errors(y_true, y_pred):
     euclidean_3d_errors = np.sqrt(horizontal_errors**2 + depth_errors**2)
 
     # Calculate success rates at different thresholds
-    thresholds = [5, 10, 15, 20, 30]
+    thresholds = [5, 10, 15, 20, 50]
     success_rates = {}
     for threshold in thresholds:
         success_rates[f"horizontal_{threshold}km"] = (
@@ -227,20 +331,20 @@ def calculate_prediction_errors(y_true, y_pred):
     return metrics, horizontal_errors, depth_errors, euclidean_3d_errors
 
 
-def create_spatiotemporal_graphs(df, time_window=24, distance_threshold=50):
+def create_spatiotemporal_graphs(df, time_window=240, max_distance=None):
     """
     Create a list of graph data objects where each node is an aftershock
-    and edges connect aftershocks that are close in space and time.
-
+    and edges fully connect all events within the time window.
+    
     Args:
         df: DataFrame with aftershock information
         time_window: Time window in hours to consider events connected
-        distance_threshold: Distance threshold in km to consider events connected
-
+        max_distance: Optional maximum distance for normalization (km)
+    
     Returns:
         List of PyTorch Geometric Data objects
     """
-    print("Creating spatiotemporal graphs...")
+    print("Creating fully connected spatiotemporal graphs...")
 
     # Convert timestamps to datetime
     timestamps = pd.to_datetime(df["source_origin_time"])
@@ -286,9 +390,7 @@ def create_spatiotemporal_graphs(df, time_window=24, distance_threshold=50):
     for i in tqdm(range(1, len(df_sorted))):
         # Get current event and all previous events
         current_time = df_sorted["time_hours"].iloc[i]
-        current_lat = df_sorted["source_latitude_deg"].iloc[i]
-        current_lon = df_sorted["source_longitude_deg"].iloc[i]
-
+        
         # Past events (including the current one)
         past_indices = list(range(i + 1))  # Include the current event
 
@@ -304,56 +406,75 @@ def create_spatiotemporal_graphs(df, time_window=24, distance_threshold=50):
             sub_features = node_features[time_indices]
             sub_targets = targets[time_indices]
 
-            # Create edges based on spatiotemporal proximity
+            # Create fully connected edges (every node connects to every other node)
             edges = []
             edge_attrs = []
 
-            for idx1, j in enumerate(time_indices):
-                j_lat = df_sorted["source_latitude_deg"].iloc[j]
-                j_lon = df_sorted["source_longitude_deg"].iloc[j]
-                j_time = df_sorted["time_hours"].iloc[j]
-
-                for idx2, k in enumerate(time_indices):
-                    if j != k:  # No self-loops
-                        k_lat = df_sorted["source_latitude_deg"].iloc[k]
-                        k_lon = df_sorted["source_longitude_deg"].iloc[k]
-                        k_time = df_sorted["time_hours"].iloc[k]
-
+            # Get all coordinates and times for efficient computation
+            lats = df_sorted["source_latitude_deg"].iloc[time_indices].values
+            lons = df_sorted["source_longitude_deg"].iloc[time_indices].values
+            times = df_sorted["time_hours"].iloc[time_indices].values
+            
+            # Find maximum distance for normalization if not provided
+            if max_distance is None:
+                max_dist = 0
+                for idx1 in range(len(time_indices)):
+                    for idx2 in range(idx1 + 1, len(time_indices)):
+                        dist = haversine_distance(lats[idx1], lons[idx1], lats[idx2], lons[idx2])
+                        max_dist = max(max_dist, dist)
+                # Add 10% to avoid division by zero issues
+                max_dist = max_dist * 1.1 if max_dist > 0 else 100
+            else:
+                max_dist = max_distance
+                
+            # Connect every node to every other node (fully connected)
+            for idx1 in range(len(time_indices)):
+                for idx2 in range(len(time_indices)):
+                    if idx1 != idx2:  # No self-loops
                         # Calculate spatial distance
-                        spatial_dist = haversine_distance(j_lat, j_lon, k_lat, k_lon)
-
+                        spatial_dist = haversine_distance(lats[idx1], lons[idx1], lats[idx2], lons[idx2])
+                        
                         # Calculate temporal distance
-                        temporal_dist = abs(j_time - k_time)
+                        temporal_dist = abs(times[idx1] - times[idx2])
+                        
+                        # Add edge
+                        edges.append([idx1, idx2])
+                        
+                        # Edge attributes: normalized inverse distance (closer = stronger)
+                        # Normalize spatial distance to [0,1] range before inversion
+                        norm_spatial_dist = min(spatial_dist / max_dist, 1.0)
+                        spatial_weight = 1.0 / (1.0 + norm_spatial_dist)
+                        
+                        # Normalize temporal distance to [0,1] range before inversion
+                        norm_temporal_dist = min(temporal_dist / time_window, 1.0)
+                        temporal_weight = 1.0 / (1.0 + norm_temporal_dist)
+                        
+                        # Combined weight reflecting both spatial and temporal proximity
+                        edge_attrs.append([spatial_weight, temporal_weight])
 
-                        # Add edge if within thresholds
-                        if (
-                            spatial_dist <= distance_threshold
-                            and temporal_dist <= time_window
-                        ):
-                            edges.append([idx1, idx2])
+            # Convert to tensor
+            edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+            edge_attr = torch.tensor(edge_attrs, dtype=torch.float)
+            x = torch.tensor(sub_features, dtype=torch.float)
+            y = torch.tensor(sub_targets, dtype=torch.float)
 
-                            # Edge attribute: inverse of distance (closer = stronger connection)
-                            edge_weight = 1.0 / (1.0 + spatial_dist)
-                            time_weight = 1.0 / (1.0 + temporal_dist)
+            # Create PyTorch Geometric data object
+            data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
 
-                            edge_attrs.append([edge_weight, time_weight])
+            # The target node is always the last one (most recent event)
+            data.num_nodes = len(time_indices)
 
-            if len(edges) > 0:  # Only create graph if there are edges
-                # Convert to tensor
-                edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
-                edge_attr = torch.tensor(edge_attrs, dtype=torch.float)
-                x = torch.tensor(sub_features, dtype=torch.float)
-                y = torch.tensor(sub_targets, dtype=torch.float)
-
-                # Create PyTorch Geometric data object
-                data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
-
-                # The target node is always the last one (most recent event)
-                data.num_nodes = len(time_indices)
-
-                graph_data_list.append(data)
+            graph_data_list.append(data)
 
     print(f"Created {len(graph_data_list)} graphs")
+    
+    # Quick graph structure check
+    print(f"First graph has {graph_data_list[0].num_nodes} nodes and {graph_data_list[0].edge_index.shape[1]} edges")
+    target_connections = sum(1 for j in range(graph_data_list[0].edge_index.shape[1]) 
+                          if graph_data_list[0].edge_index[0, j].item() == graph_data_list[0].num_nodes - 1 
+                          or graph_data_list[0].edge_index[1, j].item() == graph_data_list[0].num_nodes - 1)
+    print(f"Target node has {target_connections} connections")
+    
     return graph_data_list
 
 
@@ -568,7 +689,7 @@ class GNNAftershockPredictor:
             target = data.y[target_indices, :]
 
             # Calculate loss
-            loss = haversine_loss(pred, target)
+            loss = self.criterion(pred, target)
 
             # Backward pass
             loss.backward()
@@ -619,7 +740,7 @@ class GNNAftershockPredictor:
                 target = data.y[target_indices, :]
 
                 # Calculate loss
-                loss = haversine_loss(pred, target)
+                loss = self.criterion(pred, target)
                 val_loss += loss.item() * len(target_indices)
 
         return val_loss / len(self.val_data)
@@ -667,7 +788,7 @@ class GNNAftershockPredictor:
                 target = data.y[target_indices, :]
 
                 # Calculate loss
-                loss = haversine_loss(pred, target)
+                loss = self.criterion(pred, target)
                 test_loss += loss.item() * len(target_indices)
 
                 # Save predictions and targets
@@ -758,7 +879,7 @@ class GNNAftershockPredictor:
         plt.legend()
         plt.grid(True)
         plt.savefig(
-            f"results/learning_curve_{self.gnn_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+            f"results/learning_curve_{self.gnn_type}.png",
             dpi=300,
             bbox_inches="tight",
         )
@@ -795,7 +916,7 @@ def plot_results(y_true, y_pred, errors, model_name="GNN"):
     plt.legend()
     plt.grid(True)
     plt.savefig(
-        f"results/location_map_{model_name}_{timestamp}.png",
+        f"results/location_map_{model_name}.png",
         dpi=300,
         bbox_inches="tight",
     )
@@ -864,7 +985,7 @@ def plot_results(y_true, y_pred, errors, model_name="GNN"):
 
     plt.tight_layout()
     plt.savefig(
-        f"results/error_distribution_{model_name}_{timestamp}.png",
+        f"results/error_distribution_{model_name}.png",
         dpi=300,
         bbox_inches="tight",
     )
@@ -892,15 +1013,17 @@ def main():
 
     # Create spatiotemporal graphs
     graph_data_list = create_spatiotemporal_graphs(
-        df, time_window=10, distance_threshold=10
+        df, time_window=168, max_distance=None
     )
+
+    debug_graph_structure(graph_data_list, num_samples=20)
 
     # Set device (GPU if available)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # Train models with different GNN types
-    gnn_types = ["gat", "gcn", "sage"]
+    gnn_types = ["gcn", "sage"]
     results = {}
 
     for gnn_type in gnn_types:
@@ -957,7 +1080,7 @@ def main():
     plt.legend()
     plt.grid(True, axis="y")
     plt.savefig(
-        f'results/gnn_comparison_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png',
+        f'results/gnn_comparison.png',
         dpi=300,
         bbox_inches="tight",
     )
