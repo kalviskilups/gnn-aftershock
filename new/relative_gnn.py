@@ -1,3 +1,5 @@
+# relative_gnn.py
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -103,26 +105,6 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     r = 6371  # Radius of earth in kilometers
 
     return c * r
-
-
-def azimuth_between_points(lat1, lon1, lat2, lon2):
-    """
-    Calculate the azimuth (bearing) from point 1 to point 2 in degrees.
-    Returns an angle between 0 and 360 degrees, where 0 is North.
-    """
-    # Convert decimal degrees to radians
-    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
-
-    # Calculate azimuth
-    y = np.sin(lon2 - lon1) * np.cos(lat2)
-    x = np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(lon2 - lon1)
-    azimuth = np.arctan2(y, x)
-
-    # Convert to degrees and normalize to 0-360
-    azimuth_deg = np.degrees(azimuth)
-    azimuth_deg = (azimuth_deg + 360) % 360
-
-    return azimuth_deg
 
 
 def calculate_relative_coordinates(lat1, lon1, reference_lat, reference_lon):

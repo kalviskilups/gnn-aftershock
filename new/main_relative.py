@@ -1,3 +1,5 @@
+# main_relative.py Telplaika grafu modelēšana ar relatīvām koordinātēm precīzai pēcgrūdienu lokalizācijas prognozēšanai
+
 import pickle
 import numpy as np
 import pandas as pd
@@ -139,7 +141,7 @@ def compare_methods(rel_file="rel_results.pkl", abs_file="abs_results.pkl"):
     
     print("Comparison visualizations saved to results directory")
 
-def demo():
+def main_func():
     """Demo of the relative location GNN implementation"""
     
     # Create the output directory
@@ -154,6 +156,13 @@ def demo():
     
     # Load the data
     df = read_data_from_pickle("aftershock_data.pkl")
+    df_sorted = df.copy()
+    df_sorted["timestamp"] = pd.to_datetime(df["source_origin_time"])
+    df_sorted = df_sorted.sort_values("timestamp").drop("timestamp", axis=1)
+
+    df = df_sorted[2:]
+
+
     print(f"Loaded data with {len(df)} events")
     
     # Create relative coordinate graphs
@@ -161,14 +170,14 @@ def demo():
         df,
         time_window=168,  # One week in hours
         spatial_threshold=100,  # 100 km
-        min_connections=2
+        min_connections=3
     )
     
     print(f"Created {len(graph_data_list)} graphs in relative coordinate system")
     print(f"Reference coordinates: {reference_coords}")
     
     # Train a simple model with fewer epochs for demonstration
-    model_type = "gcn"  # Graph Attention Network
+    model_type = "gat"  # Graph Attention Network
     
     predictor = RelativeGNNAftershockPredictor(
         graph_data_list=graph_data_list,
@@ -184,7 +193,7 @@ def demo():
     predictor.debug_data_structure()
     
     # Train for just 10 epochs for demonstration
-    predictor.train(num_epochs=50, patience=15)
+    predictor.train(num_epochs=75, patience=15)
     
     # Test the model
     print(f"Testing {model_type.upper()} model...")
@@ -223,4 +232,4 @@ def demo():
         compare_methods()
 
 if __name__ == "__main__":
-    demo()
+    main_func()
