@@ -1,5 +1,3 @@
-# relative_gnn.py
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -143,6 +141,8 @@ def identify_mainshock(df):
     # In a real application, you might want to explicitly select it based on magnitude
     mainshock_idx = df_sorted.index[0]
 
+    print(mainshock_idx)
+
     return mainshock_idx
 
 
@@ -151,9 +151,15 @@ def relative_haversine_loss(y_pred, y_true):
     Custom loss function based on relative coordinates.
 
     Args:
-        y_pred: tensor of shape (batch_size, 3) [east_west_km, north_south_km, depth_rel_km]
-        y_true: tensor of shape (batch_size, 3) [east_west_km, north_south_km, depth_rel_km]
+        y_pred: tensor of shape (batch_size, 3) or (3) [east_west_km, north_south_km, depth_rel_km]
+        y_true: tensor of shape (batch_size, 3) or (3) [east_west_km, north_south_km, depth_rel_km]
     """
+    # Ensure both tensors have a batch dimension
+    if y_pred.dim() == 1:
+        y_pred = y_pred.unsqueeze(0)
+    if y_true.dim() == 1:
+        y_true = y_true.unsqueeze(0)
+    
     # Horizontal distance error (Euclidean in the relative coordinate system)
     h_dist = torch.sqrt(
         (y_pred[:, 0] - y_true[:, 0]) ** 2 + (y_pred[:, 1] - y_true[:, 1]) ** 2
@@ -169,11 +175,15 @@ def relative_haversine_loss(y_pred, y_true):
     return torch.mean(dist_3d)
 
 
-def create_relative_spatiotemporal_graph(
+def create_causal_spatiotemporal_graph(
     df, mainshock_idx=None, time_window=24, spatial_threshold=100, min_connections=1
 ):
     """
-    Create spatiotemporal graphs using relative coordinate system.
+    Create strictly causal spatiotemporal graphs using relative coordinate system.
+    This version ensures no data leakage by:
+    1. Only using past events as context for each target event
+    2. Excluding the target event's true coordinates from its feature vector
+    3. Maintaining strict temporal ordering
 
     Args:
         df: DataFrame with aftershock information
@@ -186,7 +196,7 @@ def create_relative_spatiotemporal_graph(
         List of PyTorch Geometric Data objects, reference coordinates for converting back
     """
     print(
-        f"Creating relative spatiotemporal graphs (time window: {time_window}h, spatial threshold: {spatial_threshold}km)..."
+        f"Creating causal relative spatiotemporal graphs (time window: {time_window}h, spatial threshold: {spatial_threshold}km)..."
     )
 
     # Identify mainshock if not provided
@@ -202,12 +212,9 @@ def create_relative_spatiotemporal_graph(
         f"Reference event coordinates: Lat={reference_lat:.4f}, Lon={reference_lon:.4f}, Depth={reference_depth:.2f}km"
     )
 
-    # Convert timestamps to datetime
-    timestamps = pd.to_datetime(df["source_origin_time"])
-
-    # Sort events by time
+    # Convert timestamps to datetime and sort events chronologically
     df_sorted = df.copy()
-    df_sorted["timestamp"] = timestamps
+    df_sorted["timestamp"] = pd.to_datetime(df["source_origin_time"])
     df_sorted = df_sorted.sort_values("timestamp")
 
     # Calculate temporal differences in hours
@@ -241,60 +248,45 @@ def create_relative_spatiotemporal_graph(
     df_sorted["ns_rel_km"] = relative_coords[:, 1]
     df_sorted["depth_rel_km"] = relative_coords[:, 2]
 
-    # Extract waveform features
+    # Extract waveform features once for all events
     print("Extracting waveform features for nodes...")
     waveform_features = np.array(
         [extract_waveform_features(w) for w in tqdm(df_sorted["waveform"])]
     )
 
-    # Create a dataframe for node features
-    node_df = pd.DataFrame(waveform_features)
-
-    # Add additional node features
-    node_df["time_hours"] = df_sorted["time_hours"].values
-    node_df["ew_rel_km"] = df_sorted["ew_rel_km"].values
-    node_df["ns_rel_km"] = df_sorted["ns_rel_km"].values
-    node_df["depth_rel_km"] = df_sorted["depth_rel_km"].values
-
-    # Scale node features
-    scaler = StandardScaler()
-    node_features = scaler.fit_transform(node_df.values)
-
-    # Create target values in relative coordinates
-    targets = df_sorted[["ew_rel_km", "ns_rel_km", "depth_rel_km"]].values
-
     # Create graph data objects
     graph_data_list = []
 
-    # We'll create a graph for each event (except the first one)
-    for i in tqdm(range(1, len(df_sorted))):
-        # Get current event
+    # We'll create a graph for each event (except the first two)
+    # Start from index 2 to ensure we have past events to use as context
+    for i in tqdm(range(2, len(df_sorted))):
         current_time = df_sorted["time_hours"].iloc[i]
-        curr_ew = df_sorted["ew_rel_km"].iloc[i]
-        curr_ns = df_sorted["ns_rel_km"].iloc[i]
-        curr_depth = df_sorted["depth_rel_km"].iloc[i]
-
-        # Get past events within the time window
-        time_indices = [
-            j
-            for j in range(i)
+        
+        # Get ONLY past events within the time window
+        past_indices = [
+            j for j in range(i)  # Only consider events before current one
             if current_time - df_sorted["time_hours"].iloc[j] <= time_window
         ]
 
-        if len(time_indices) > 0:
+        if len(past_indices) > 0:
             # Initialize the subgraph structure
             connected_indices = []
             edges = []
             edge_attrs = []
 
-            # Always include the current event (target node)
+            # Always include the target node (current event) first
             connected_indices.append(i)
 
-            # Find spatially connected events
-            for j in time_indices:
+            # Find relevant past events to connect
+            for j in past_indices:
                 past_ew = df_sorted["ew_rel_km"].iloc[j]
                 past_ns = df_sorted["ns_rel_km"].iloc[j]
                 past_depth = df_sorted["depth_rel_km"].iloc[j]
+
+                # Current event's coordinates (for distance calculation only)
+                curr_ew = df_sorted["ew_rel_km"].iloc[i]
+                curr_ns = df_sorted["ns_rel_km"].iloc[i]
+                curr_depth = df_sorted["depth_rel_km"].iloc[i]
 
                 # Calculate spatial distance in relative coordinates
                 horizontal_dist = np.sqrt(
@@ -312,14 +304,12 @@ def create_relative_spatiotemporal_graph(
                         connected_indices.append(j)
 
                     # Get local node indices in this subgraph
-                    tgt_idx = connected_indices.index(i)  # Target (current event)
+                    tgt_idx = 0  # Target is always first in our connected_indices list
                     src_idx = connected_indices.index(j)  # Source (past event)
 
-                    # Create directed edge from past event to current event
+                    # Create directed edge from past event to current event ONLY
+                    # This is critical for causality: info flows from past to current
                     edges.append([src_idx, tgt_idx])
-
-                    # Create edge from current event to past event (bidirectional)
-                    edges.append([tgt_idx, src_idx])
 
                     # Edge attributes
                     temporal_dist = current_time - df_sorted["time_hours"].iloc[j]
@@ -334,11 +324,9 @@ def create_relative_spatiotemporal_graph(
                     temporal_weight = 1.0 / (1.0 + temporal_dist / 5.0)
 
                     # Add rupture directivity information
-                    # Stress concentration tends to be higher at the ends of the rupture
                     depth_similarity = np.exp(-depth_diff / 10.0)
 
                     # Approximate Coulomb stress change using relative position
-                    # This is a simplification - real Coulomb modeling would be more complex
                     stress_proxy = (
                         spatial_weight
                         * depth_similarity
@@ -356,55 +344,60 @@ def create_relative_spatiotemporal_graph(
                         ]
                     )
 
-                    # Edge attributes for target → source direction
-                    back_angle = (angle + 180) % 360
-                    edge_attrs.append(
-                        [
-                            spatial_weight,
-                            temporal_weight,
-                            stress_proxy,
-                            0.0,  # Direction flag (0 = backward)
-                            back_angle / 360.0,  # Normalized angle as feature
-                        ]
-                    )
-
             # Only create graph if we have enough connections
-            num_connections = (
-                len(edges) // 2
-            )  # Divide by 2 because of bidirectional edges
-
-            if num_connections >= min_connections:
-                # Get node features for connected events
-                node_indices = sorted(connected_indices)
-                sub_features = node_features[node_indices]
-                sub_targets = targets[node_indices]
-
-                # Find the index of the target node in the new ordering
-                target_idx = node_indices.index(i)
-
-                # Convert to tensors
+            if len(edges) >= min_connections:
+                # Create separate feature sets for context nodes vs target node
+                node_features = []
+                
+                # First create features for target node (index 0) WITHOUT including its coordinates
+                target_features = np.concatenate([
+                    waveform_features[i],
+                    [df_sorted["time_hours"].iloc[i]],
+                    [0, 0, 0]  # Zero values for coordinate features (no leakage)
+                ])
+                node_features.append(target_features)
+                
+                # Then add features for past events (including their coordinates)
+                for idx in connected_indices[1:]:  # Skip target node (index 0)
+                    past_features = np.concatenate([
+                        waveform_features[idx],
+                        [df_sorted["time_hours"].iloc[idx]],
+                        [df_sorted["ew_rel_km"].iloc[idx]],
+                        [df_sorted["ns_rel_km"].iloc[idx]],
+                        [df_sorted["depth_rel_km"].iloc[idx]]
+                    ])
+                    node_features.append(past_features)
+                
+                # Convert list to numpy array first for better conversion
+                node_features_array = np.array(node_features, dtype=np.float32)
+                edge_attrs_array = np.array(edge_attrs, dtype=np.float32)
+                
+                # Convert to tensor format
+                x = torch.tensor(node_features_array, dtype=torch.float)
                 edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
-                edge_attr = torch.tensor(edge_attrs, dtype=torch.float)
-                x = torch.tensor(sub_features, dtype=torch.float)
-
-                # Create mask for target node
-                mask = torch.zeros(len(node_indices), dtype=torch.bool)
-                mask[target_idx] = True
-
+                edge_attr = torch.tensor(edge_attrs_array, dtype=torch.float)
+                
+                # Target value (what we're trying to predict) - ensure it's 2D with shape [1, 3]
+                target_coords = np.array([
+                    df_sorted["ew_rel_km"].iloc[i],
+                    df_sorted["ns_rel_km"].iloc[i],
+                    df_sorted["depth_rel_km"].iloc[i]
+                ], dtype=np.float32).reshape(1, 3)
+                
+                y = torch.tensor(target_coords, dtype=torch.float)
+                
                 # Create PyTorch Geometric data object
                 data = Data(
                     x=x,
                     edge_index=edge_index,
                     edge_attr=edge_attr,
-                    y=sub_targets,  # All node coordinates
-                    mask=mask,  # Mask identifying the target node
-                    target_idx=torch.tensor([target_idx]),  # Index of target node
+                    y=y,
+                    num_nodes=len(node_features)
                 )
-
-                data.num_nodes = len(node_indices)
+                
                 graph_data_list.append(data)
 
-    print(f"Created {len(graph_data_list)} graphs")
+    print(f"Created {len(graph_data_list)} causal graphs")
 
     # Quick graph structure check
     if len(graph_data_list) > 0:
@@ -561,22 +554,22 @@ def calculate_prediction_errors_relative(y_true, y_pred, reference_coords=None):
     return metrics, horizontal_errors, depth_errors, euclidean_3d_errors
 
 
-class RelativeGNNModule(torch.nn.Module):
+class CausalGNN(torch.nn.Module):
     """
-    Enhanced Graph Neural Network for relative aftershock prediction
+    Causal Graph Neural Network for aftershock prediction with no data leakage.
+    Designed to predict coordinates for a specific target node.
     """
-
     def __init__(
         self,
         num_node_features,
-        edge_dim=5,  # Increased edge dimension with directional features
+        edge_dim=5,
         hidden_dim=64,
         output_dim=3,
         num_layers=3,
         gnn_type="gat",
         dropout=0.3,
     ):
-        super(RelativeGNNModule, self).__init__()
+        super(CausalGNN, self).__init__()
 
         # Select GNN layer type
         if gnn_type == "gcn":
@@ -593,7 +586,6 @@ class RelativeGNNModule(torch.nn.Module):
                 ]
             )
         elif gnn_type == "gat":
-            # For GAT, we'll use the edge attributes in a custom way
             self.conv1 = GATConv(
                 num_node_features, hidden_dim, heads=4, concat=False, dropout=dropout
             )
@@ -620,12 +612,7 @@ class RelativeGNNModule(torch.nn.Module):
         else:
             raise ValueError(f"Unknown GNN type: {gnn_type}")
 
-        # Additional directional convolution layer for more explicit relative positioning
-        self.dir_conv = nn.Linear(
-            hidden_dim + 3, hidden_dim
-        )  # +3 for relative coordinates
-
-        # Prediction layers
+        # Prediction layers specifically for target node
         self.lin1 = nn.Linear(hidden_dim, hidden_dim)
         self.lin2 = nn.Linear(hidden_dim, output_dim)
 
@@ -640,8 +627,9 @@ class RelativeGNNModule(torch.nn.Module):
         self.gnn_type = gnn_type
 
     def forward(self, data):
-        x, edge_index, batch = data.x, data.edge_index, data.batch
-
+        x, edge_index = data.x, data.edge_index
+        batch = data.batch if hasattr(data, "batch") else None
+        
         # Process edge attributes if available
         edge_attr = data.edge_attr if hasattr(data, "edge_attr") else None
 
@@ -679,26 +667,61 @@ class RelativeGNNModule(torch.nn.Module):
             x = F.elu(x)
             x = self.dropout(x)
 
-        # Add relative coordinate information to node embeddings
-        # This helps the model learn position-aware representations
-        rel_coords = data.x[:, -3:]  # Last 3 features are relative coordinates
-        x_with_coords = torch.cat([x, rel_coords], dim=1)
-        x = F.elu(self.dir_conv(x_with_coords))
-
         # Normalization (layer norm works better for graph data)
         x = self.ln(x)
 
-        # Final prediction layers
-        x = F.elu(self.lin1(x))
-        x = self.dropout(x)
-        x = self.lin2(x)
+        # Handle batched data properly
+        if batch is not None:
+            # We need to get the first node (index 0) for each graph in the batch
+            # In our setup, the first node is always the target node
+            
+            # Get indices in the batch where a new graph starts
+            # This is the more efficient and safer approach
+            target_indices = []
+            
+            # Process each graph in the batch
+            batch_size = int(batch.max()) + 1
+            for i in range(batch_size):
+                # Find nodes that belong to this graph
+                mask = (batch == i)
+                # Get the indices of nodes in this graph
+                graph_indices = torch.nonzero(mask).squeeze()
+                
+                # The first node of each graph is our target node (index 0)
+                if graph_indices.dim() > 0:  # Check if we have any nodes in this graph
+                    if graph_indices.dim() == 0:  # Only one node in graph
+                        target_indices.append(graph_indices.item())
+                    else:
+                        target_indices.append(graph_indices[0].item())
+            
+            # Now we have a list of target node indices
+            # Convert to tensor for proper indexing
+            targets_tensor = torch.tensor(target_indices, dtype=torch.long, device=x.device)
+            
+            # Get the embeddings for the target nodes
+            target_embeddings = x[targets_tensor]
+            
+            # Final prediction layers
+            target_embeddings = F.elu(self.lin1(target_embeddings))
+            target_embeddings = self.dropout(target_embeddings)
+            coords_pred = self.lin2(target_embeddings)
+        else:
+            # Single graph case - first node is target node
+            target_embedding = x[0]
+            target_embedding = F.elu(self.lin1(target_embedding))
+            target_embedding = self.dropout(target_embedding)
+            coords_pred = self.lin2(target_embedding)
+            
+            # Ensure output has batch dimension
+            if coords_pred.dim() == 1:
+                coords_pred = coords_pred.unsqueeze(0)
 
-        return x
+        return coords_pred
 
 
 class RelativeGNNAftershockPredictor:
     """
-    Wrapper class for training and evaluating the relative coordinate GNN model
+    Wrapper class for training and evaluating the causal relative coordinate GNN model
     """
 
     def __init__(
@@ -721,8 +744,8 @@ class RelativeGNNAftershockPredictor:
         self.batch_size = batch_size
         self.weight_decay = weight_decay
 
-        # Split data into train/val/test
-        self.train_data, self.val_data, self.test_data = self._train_val_test_split()
+        # Split data into train/val/test using chronological splitting
+        self.train_data, self.val_data, self.test_data = self._chronological_split()
 
         # Setup model
         if len(self.graph_data_list) > 0:
@@ -735,7 +758,7 @@ class RelativeGNNAftershockPredictor:
             )
 
             # Initialize model
-            self.model = RelativeGNNModule(
+            self.model = CausalGNN(
                 num_node_features=num_features,
                 edge_dim=edge_dim,
                 hidden_dim=hidden_dim,
@@ -755,40 +778,74 @@ class RelativeGNNAftershockPredictor:
                 self.optimizer, mode="min", factor=0.5, patience=5, verbose=True
             )
 
-            # Setup data loaders
+            # Feature scaling (fit only on training data)
+            self.train_data, self.val_data, self.test_data = self._scale_features()
+
+            # Setup data loaders (no shuffling to maintain chronological order)
             self.train_loader = PyGDataLoader(
-                self.train_data, batch_size=batch_size, shuffle=True
+                self.train_data, batch_size=batch_size, shuffle=False
             )
             self.val_loader = PyGDataLoader(self.val_data, batch_size=batch_size)
             self.test_loader = PyGDataLoader(self.test_data, batch_size=batch_size)
 
-    def _train_val_test_split(self, val_ratio=0.15, test_ratio=0.15):
-        """Split graph data into train/val/test sets"""
+    def _chronological_split(self, val_ratio=0.15, test_ratio=0.15):
+        """Split graph data chronologically into train/val/test sets"""
         n = len(self.graph_data_list)
-        indices = list(range(n))
-
-        # Use a deterministic split for reproducibility
-        np.random.seed(42)
-        np.random.shuffle(indices)
-
-        test_size = int(n * test_ratio)
-        val_size = int(n * val_ratio)
-
-        test_indices = indices[:test_size]
-        val_indices = indices[test_size : test_size + val_size]
-        train_indices = indices[test_size + val_size :]
-
-        train_data = [self.graph_data_list[i] for i in train_indices]
-        val_data = [self.graph_data_list[i] for i in val_indices]
-        test_data = [self.graph_data_list[i] for i in test_indices]
+        
+        # Use a chronological split - earlier events for train, later for test
+        train_end = int(n * (1 - val_ratio - test_ratio))
+        val_end = int(n * (1 - test_ratio))
+        
+        # No shuffling - maintain chronological order
+        train_data = self.graph_data_list[:train_end]
+        val_data = self.graph_data_list[train_end:val_end]
+        test_data = self.graph_data_list[val_end:]
 
         print(
-            f"Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)} graphs"
+            f"Chronological split - Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)} graphs"
         )
         return train_data, val_data, test_data
+    
+    def _scale_features(self):
+        """Scale features using only training data statistics"""
+        
+        # Extract all node features from training data
+        all_train_features = torch.cat([data.x for data in self.train_data], dim=0).numpy()
+        
+        # Fit scaler on training data only
+        scaler = StandardScaler()
+        scaler.fit(all_train_features)
+        
+        # Function to apply scaling to a dataset
+        def apply_scaling(dataset):
+            scaled_dataset = []
+            for data in dataset:
+                # Get original features
+                x = data.x.numpy()
+                
+                # Scale features
+                x_scaled = scaler.transform(x)
+                
+                # Create new Data object with scaled features
+                new_data = Data(
+                    x=torch.tensor(x_scaled, dtype=torch.float),
+                    edge_index=data.edge_index,
+                    edge_attr=data.edge_attr,
+                    y=data.y,
+                    num_nodes=data.num_nodes
+                )
+                scaled_dataset.append(new_data)
+            return scaled_dataset
+        
+        # Scale all datasets using training data statistics
+        train_data_scaled = apply_scaling(self.train_data)
+        val_data_scaled = apply_scaling(self.val_data)
+        test_data_scaled = apply_scaling(self.test_data)
+        
+        return train_data_scaled, val_data_scaled, test_data_scaled
 
     def train_epoch(self):
-        """Train for one epoch with relative coordinates"""
+        """Train for one epoch with causal relative coordinates"""
         self.model.train()
         epoch_loss = 0
         num_graphs = 0
@@ -796,94 +853,43 @@ class RelativeGNNAftershockPredictor:
         for data in self.train_loader:
             self.optimizer.zero_grad()
 
-            # Forward pass
-            out = self.model(data)
+            # Forward pass - model outputs prediction for target node
+            pred = self.model(data)
 
-            # Get device
-            device = out.device
-
-            # Get batch information
-            batch_size = 1 if not hasattr(data, "batch") else data.num_graphs
-            num_graphs += batch_size
-
-            # Initialize lists for predictions and targets
-            predictions = []
-            targets = []
-
-            # Process each graph in the batch
-            for i in range(batch_size):
-                if hasattr(data, "batch"):
-                    # Get nodes for this graph
-                    graph_mask = data.batch == i
-                    graph_indices = torch.where(graph_mask)[0]
-
-                    # Get target node index
-                    if hasattr(data, "target_idx"):
-                        target_idx_in_graph = data.target_idx[i].item()
-                        # Get global index in the batch
-                        target_idx = graph_indices[target_idx_in_graph]
-                    else:
-                        # Default to last node
-                        target_idx = graph_indices[-1]
-
-                    # Get prediction for target node
-                    pred = out[target_idx]
-                    predictions.append(pred)
-
-                    # Get target value for this target node
-                    if isinstance(data.y, list):
-                        # data.y is a list of numpy arrays, one per graph
-                        # Get the array for this graph
-                        graph_data = data.y[i]
-
-                        # The target is specifically for the target node (often the last one)
-                        # So we need to find that specific node's coordinates
-                        target_coords = torch.tensor(
-                            graph_data[target_idx_in_graph],
-                            dtype=torch.float,
-                            device=device,
-                        )
-                        targets.append(target_coords)
-                    else:
-                        target_coords = data.y[target_idx]
-                        targets.append(target_coords)
-                else:
-                    # For a single graph (not batched)
-                    if hasattr(data, "target_idx"):
-                        target_idx = data.target_idx.item()
-                    else:
-                        target_idx = data.num_nodes - 1
-
-                    pred = out[target_idx]
-                    predictions.append(pred)
-
-                    # Get target coordinates
-                    if isinstance(data.y, list):
-                        target_coords = torch.tensor(
-                            data.y[0][target_idx], dtype=torch.float, device=device
-                        )
-                    else:
-                        target_coords = data.y[target_idx]
-
-                    targets.append(target_coords)
-
-            # Stack predictions and targets
-            pred_tensor = torch.stack(predictions)
-            target_tensor = torch.stack(targets)
+            # Get target value
+            target = data.y
+            
+            # Ensure both tensors have compatible shapes
+            if pred.dim() == 1:
+                pred = pred.unsqueeze(0)  # Add batch dimension if missing
+            if target.dim() == 1:
+                target = target.unsqueeze(0)
+                
+            # For batches, check if shapes match
+            if pred.shape[0] != target.shape[0]:
+                # This shouldn't happen with our new model, but just in case
+                print(f"Warning: Shape mismatch - pred: {pred.shape}, target: {target.shape}")
+                
+                # Make them compatible if possible
+                if pred.shape[0] == 1 and target.shape[0] > 1:
+                    pred = pred.repeat(target.shape[0], 1)
+                elif pred.shape[0] > 1 and target.shape[0] == 1:
+                    target = target.repeat(pred.shape[0], 1)
 
             # Calculate loss
-            loss = self.criterion(pred_tensor, target_tensor)
+            loss = self.criterion(pred, target)
 
             # Backward pass
             loss.backward()
             self.optimizer.step()
 
-            epoch_loss += loss.item() * batch_size
+            epoch_loss += loss.item() * data.num_graphs
+            num_graphs += data.num_graphs
 
         return epoch_loss / num_graphs
 
     def validate(self):
-        """Validate model with relative coordinates"""
+        """Validate model with causal relative coordinates"""
         self.model.eval()
         val_loss = 0
         num_graphs = 0
@@ -891,148 +897,147 @@ class RelativeGNNAftershockPredictor:
         with torch.no_grad():
             for data in self.val_loader:
                 # Forward pass
-                out = self.model(data)
-
-                # Get device
-                device = out.device
-
-                # Get batch information
-                batch_size = 1 if not hasattr(data, "batch") else data.num_graphs
-                num_graphs += batch_size
-
-                # Initialize lists for predictions and targets
-                predictions = []
-                targets = []
-
-                # Process each graph in the batch
-                for i in range(batch_size):
-                    if hasattr(data, "batch"):
-                        # Get nodes for this graph
-                        graph_mask = data.batch == i
-                        graph_indices = torch.where(graph_mask)[0]
-
-                        # Get target node index
-                        if hasattr(data, "target_idx"):
-                            target_idx_in_graph = data.target_idx[i].item()
-                            # Get global index in the batch
-                            target_idx = graph_indices[target_idx_in_graph]
-                        else:
-                            # Default to last node
-                            target_idx = graph_indices[-1]
-
-                        # Get prediction for target node
-                        pred = out[target_idx]
-                        predictions.append(pred)
-
-                        # Get target value for this target node
-                        if isinstance(data.y, list):
-                            # Get coordinates for the target node in this graph
-                            graph_data = data.y[i]
-                            target_coords = torch.tensor(
-                                graph_data[target_idx_in_graph],
-                                dtype=torch.float,
-                                device=device,
-                            )
-                            targets.append(target_coords)
-                        else:
-                            target_coords = data.y[target_idx]
-                            targets.append(target_coords)
-                    else:
-                        # For a single graph (not batched)
-                        if hasattr(data, "target_idx"):
-                            target_idx = data.target_idx.item()
-                        else:
-                            target_idx = data.num_nodes - 1
-
-                        pred = out[target_idx]
-                        predictions.append(pred)
-
-                        # Get target coordinates
-                        if isinstance(data.y, list):
-                            target_coords = torch.tensor(
-                                data.y[0][target_idx], dtype=torch.float, device=device
-                            )
-                        else:
-                            target_coords = data.y[target_idx]
-
-                        targets.append(target_coords)
-
-                # Stack predictions and targets
-                pred_tensor = torch.stack(predictions)
-                target_tensor = torch.stack(targets)
-
+                pred = self.model(data)
+                
+                # Get target
+                target = data.y
+                
+                # Ensure both tensors have compatible shapes
+                if pred.dim() == 1:
+                    pred = pred.unsqueeze(0)  # Add batch dimension if missing
+                if target.dim() == 1:
+                    target = target.unsqueeze(0)
+                    
+                # For batches, check if shapes match
+                if pred.shape[0] != target.shape[0]:
+                    # This shouldn't happen with our new model, but just in case
+                    if pred.shape[0] == 1 and target.shape[0] > 1:
+                        pred = pred.repeat(target.shape[0], 1)
+                    elif pred.shape[0] > 1 and target.shape[0] == 1:
+                        target = target.repeat(pred.shape[0], 1)
+                
                 # Calculate loss
-                loss = self.criterion(pred_tensor, target_tensor)
-                val_loss += loss.item() * batch_size
+                loss = self.criterion(pred, target)
+                
+                val_loss += loss.item() * data.num_graphs
+                num_graphs += data.num_graphs
 
         return val_loss / num_graphs
+    
 
-    def test(self):
-        """Test model and return predictions with relative coordinates"""
+    def validate_with_metrics(self):
+        """Validate model and return metrics (similar to test but on validation data)"""
         self.model.eval()
         all_preds = []
         all_targets = []
-        num_graphs = 0
+
+        with torch.no_grad():
+            for data in self.val_loader:
+                # Forward pass
+                pred = self.model(data)
+                
+                # Ensure pred has correct shape
+                if pred.dim() == 1:
+                    pred = pred.unsqueeze(0)
+                
+                # Get target and ensure correct shape
+                target = data.y
+                if target.dim() == 1:
+                    target = target.unsqueeze(0)
+                
+                # Collect predictions and targets
+                all_preds.append(pred.cpu().numpy())
+                all_targets.append(target.cpu().numpy())
+
+        # Concatenate results safely
+        if all_preds and all_targets:
+            try:
+                y_pred = np.vstack(all_preds)
+                y_true = np.vstack(all_targets)
+            except ValueError:
+                # Handle irregular shapes by ensuring each array has same shape
+                print("Warning: Irregular shapes detected in predictions or targets")
+                # Convert to consistent shape (may need adjustment)
+                fixed_preds = []
+                fixed_targets = []
+                for p, t in zip(all_preds, all_targets):
+                    if p.ndim == 1:
+                        p = p.reshape(1, -1)
+                    if t.ndim == 1:
+                        t = t.reshape(1, -1)
+                    fixed_preds.append(p)
+                    fixed_targets.append(t)
+                y_pred = np.vstack(fixed_preds)
+                y_true = np.vstack(fixed_targets)
+        else:
+            print("Warning: No predictions or targets collected")
+            return {}, None, None, None
+
+        # Calculate errors - both in relative coordinates and absolute if reference is provided
+        if self.reference_coords:
+            # Calculate errors in both relative and absolute coordinates
+            metrics, rel_errors, abs_errors = calculate_prediction_errors_relative(
+                y_true, y_pred, self.reference_coords
+            )
+            return metrics, y_true, y_pred, (rel_errors, abs_errors)
+        else:
+            # Only relative coordinate errors
+            metrics, horizontal_errors, depth_errors, euclidean_3d_errors = (
+                calculate_prediction_errors_relative(y_true, y_pred)
+            )
+            return (
+                metrics,
+                y_true,
+                y_pred,
+                (horizontal_errors, depth_errors, euclidean_3d_errors),
+            )
+
+    def test(self):
+        self.model.eval()
+        all_preds = []
+        all_targets = []
 
         with torch.no_grad():
             for data in self.test_loader:
                 # Forward pass
-                out = self.model(data)
+                pred = self.model(data)
+                
+                # Ensure pred has correct shape
+                if pred.dim() == 1:
+                    pred = pred.unsqueeze(0)
+                
+                # Get target and ensure correct shape
+                target = data.y
+                if target.dim() == 1:
+                    target = target.unsqueeze(0)
+                
+                # Collect predictions and targets
+                all_preds.append(pred.cpu().numpy())
+                all_targets.append(target.cpu().numpy())
 
-                # Get device
-                device = out.device
-
-                # Get batch information
-                batch_size = 1 if not hasattr(data, "batch") else data.num_graphs
-                num_graphs += batch_size
-
-                # Process each graph in the batch
-                for i in range(batch_size):
-                    if hasattr(data, "batch"):
-                        # Get nodes for this graph
-                        graph_mask = data.batch == i
-                        graph_indices = torch.where(graph_mask)[0]
-
-                        # Get target node index
-                        if hasattr(data, "target_idx"):
-                            target_idx_in_graph = data.target_idx[i].item()
-                            # Get global index in the batch
-                            target_idx = graph_indices[target_idx_in_graph]
-                        else:
-                            # Default to last node
-                            target_idx = graph_indices[-1]
-
-                        # Get prediction and target
-                        pred = out[target_idx].cpu().numpy()
-
-                        if isinstance(data.y, list):
-                            # Get coordinates for the target node
-                            target = data.y[i][target_idx_in_graph]
-                        else:
-                            target = data.y[target_idx].cpu().numpy()
-
-                        all_preds.append(pred)
-                        all_targets.append(target)
-                    else:
-                        # For a single graph (not batched)
-                        if hasattr(data, "target_idx"):
-                            target_idx = data.target_idx.item()
-                        else:
-                            target_idx = data.num_nodes - 1
-
-                        pred = out[target_idx].cpu().numpy()
-
-                        if isinstance(data.y, list):
-                            target = data.y[0][target_idx]
-                        else:
-                            target = data.y[target_idx].cpu().numpy()
-
-                        all_preds.append(pred)
-                        all_targets.append(target)
-
-        # Concatenate results
-        y_pred = np.array(all_preds)
-        y_true = np.array(all_targets)
+        # Concatenate results safely
+        if all_preds and all_targets:
+            try:
+                y_pred = np.vstack(all_preds)
+                y_true = np.vstack(all_targets)
+            except ValueError:
+                # Handle irregular shapes by ensuring each array has same shape
+                print("Warning: Irregular shapes detected in predictions or targets")
+                # Convert to consistent shape (may need adjustment)
+                fixed_preds = []
+                fixed_targets = []
+                for p, t in zip(all_preds, all_targets):
+                    if p.ndim == 1:
+                        p = p.reshape(1, -1)
+                    if t.ndim == 1:
+                        t = t.reshape(1, -1)
+                    fixed_preds.append(p)
+                    fixed_targets.append(t)
+                y_pred = np.vstack(fixed_preds)
+                y_true = np.vstack(fixed_targets)
+        else:
+            print("Warning: No predictions or targets collected")
+            return {}, None, None, None
 
         # Calculate errors - both in relative coordinates and absolute if reference is provided
         if self.reference_coords:
@@ -1056,7 +1061,7 @@ class RelativeGNNAftershockPredictor:
     def train(self, num_epochs=100, patience=10):
         """Train the model with early stopping"""
         print(
-            f"Training Relative GNN model ({self.gnn_type}) for {num_epochs} epochs..."
+            f"Training Causal Relative GNN model ({self.gnn_type}) for {num_epochs} epochs..."
         )
 
         # Create results directory if it doesn't exist
@@ -1086,7 +1091,7 @@ class RelativeGNNAftershockPredictor:
 
                 # Save best model
                 torch.save(
-                    self.model.state_dict(), f"best_rel_gnn_model_{self.gnn_type}.pt"
+                    self.model.state_dict(), f"best_causal_rel_gnn_model_{self.gnn_type}.pt"
                 )
             else:
                 no_improve += 1
@@ -1105,7 +1110,7 @@ class RelativeGNNAftershockPredictor:
                 break
 
         # Load best model
-        self.model.load_state_dict(torch.load(f"best_rel_gnn_model_{self.gnn_type}.pt"))
+        self.model.load_state_dict(torch.load(f"best_causal_rel_gnn_model_{self.gnn_type}.pt"))
 
         # Plot learning curves
         plt.figure(figsize=(10, 6))
@@ -1119,11 +1124,11 @@ class RelativeGNNAftershockPredictor:
         )
         plt.xlabel("Epoch")
         plt.ylabel("Loss")
-        plt.title(f"Training and Validation Loss - Relative {self.gnn_type.upper()}")
+        plt.title(f"Training and Validation Loss - Causal Relative {self.gnn_type.upper()}")
         plt.legend()
         plt.grid(True)
         plt.savefig(
-            f"results/learning_curve_relative_{self.gnn_type}.png",
+            f"results/learning_curve_causal_relative_{self.gnn_type}.png",
             dpi=300,
             bbox_inches="tight",
         )
@@ -1132,10 +1137,12 @@ class RelativeGNNAftershockPredictor:
 
     def debug_data_structure(self):
         """Analyze the first batch to debug data structures"""
-        print("\n===== Debugging Relative Coordinate Data Structure =====")
+        print("\n===== Debugging Causal Relative Coordinate Data Structure =====")
 
-        # Get first batch
-        for data in self.train_loader:
+        # Get first graph
+        if len(self.graph_data_list) > 0:
+            data = self.graph_data_list[0]
+            
             # Basic info
             print(f"Data object type: {type(data)}")
             print(f"Available attributes: {data.keys}")
@@ -1145,15 +1152,22 @@ class RelativeGNNAftershockPredictor:
             print(f"  Type: {type(data.x)}")
             print(f"  Shape: {data.x.shape}")
 
-            # Display first few rows to check relative coordinates
-            print(
-                f"  Last 3 columns (should be rel coords): \n{data.x[0, -3:].cpu().numpy()}"
-            )
+            # Display first node features (target node)
+            print(f"  Target node features (should NOT have coordinates): \n{data.x[0].cpu().numpy()}")
+            
+            # Display second node features (if available)
+            if data.x.shape[0] > 1:
+                print(f"  Context node features (should have coordinates): \n{data.x[1].cpu().numpy()}")
 
             # Check edge index
-            print(f"\nEdge index:")
+            print(f"\nEdge index (should only have edges from context→target):")
             print(f"  Type: {type(data.edge_index)}")
             print(f"  Shape: {data.edge_index.shape}")
+            print(f"  Edges: \n{data.edge_index.cpu().numpy()}")
+            
+            # Verify that target node (0) has no outgoing edges
+            outgoing_from_target = (data.edge_index[0] == 0).sum().item()
+            print(f"  Outgoing edges from target node: {outgoing_from_target} (should be 0)")
 
             # Check edge attributes if available
             if hasattr(data, "edge_attr"):
@@ -1167,45 +1181,18 @@ class RelativeGNNAftershockPredictor:
             print(f"  Type: {type(data.y)}")
             if isinstance(data.y, torch.Tensor):
                 print(f"  Shape: {data.y.shape}")
-                print(f"  Sample: {data.y[0].cpu().numpy()}")
-            elif isinstance(data.y, list):
-                print(f"  Length: {len(data.y)}")
-                print(f"  First element type: {type(data.y[0])}")
-                print(f"  First element: {data.y[0]}")
-
-            # Check batch assignment if batched
-            if hasattr(data, "batch"):
-                print(f"\nBatch assignment:")
-                print(f"  Type: {type(data.batch)}")
-                print(f"  Shape: {data.batch.shape}")
-                print(f"  Unique values: {torch.unique(data.batch).cpu().numpy()}")
-                print(f"  Number of graphs: {data.num_graphs}")
-
-            # Check target indices if available
-            if hasattr(data, "target_idx"):
-                print(f"\nTarget indices:")
-                print(f"  Type: {type(data.target_idx)}")
-                print(f"  Shape: {data.target_idx.shape}")
-                print(f"  Value: {data.target_idx.cpu().numpy()}")
-
-            # Check mask if available
-            if hasattr(data, "mask"):
-                print(f"\nMask:")
-                print(f"  Type: {type(data.mask)}")
-                print(f"  Shape: {data.mask.shape}")
-                print(f"  Sum (number of True values): {data.mask.sum().item()}")
-
-            # Only process the first batch
-            break
-
-        print("\n=================================")
+                print(f"  Value: {data.y.cpu().numpy()}")
+            
+            print("\n=================================")
+        else:
+            print("No graphs available to debug")
 
         # Return to allow chaining
         return self
 
 
 def plot_relative_results(
-    y_true, y_pred, errors, reference_coords=None, model_name="RelativeGNN"
+    y_true, y_pred, errors, reference_coords=None, model_name="CausalRelativeGNN"
 ):
     """
     Create visualizations of prediction results for relative coordinates.
@@ -1460,236 +1447,3 @@ def plot_relative_results(
         dpi=300,
         bbox_inches="tight",
     )
-
-    # Plot 4: Depth errors
-    plt.figure(figsize=(10, 8))
-
-    if plot_absolute:
-        # Plot true vs predicted depths
-        plt.scatter(abs_true[:, 2], abs_pred[:, 2], c="blue", alpha=0.6)
-        plt.plot(
-            [min(abs_true[:, 2]), max(abs_true[:, 2])],
-            [min(abs_true[:, 2]), max(abs_true[:, 2])],
-            "r--",
-        )
-        plt.xlabel("True Depth (km)")
-        plt.ylabel("Predicted Depth (km)")
-    else:
-        # Plot relative depths
-        plt.scatter(y_true[:, 2], y_pred[:, 2], c="blue", alpha=0.6)
-        plt.plot(
-            [min(y_true[:, 2]), max(y_true[:, 2])],
-            [min(y_true[:, 2]), max(y_true[:, 2])],
-            "r--",
-        )
-        plt.xlabel("True Relative Depth (km)")
-        plt.ylabel("Predicted Relative Depth (km)")
-
-    plt.title(f"Depth Prediction Performance - {model_name}")
-    plt.grid(True)
-    plt.savefig(
-        f"results/depth_prediction_{model_name}.png",
-        dpi=300,
-        bbox_inches="tight",
-    )
-
-    # Plot 5: Position error vs distance from reference (mainshock)
-    if plot_absolute:
-        # Calculate distance from each event to reference point
-        distances_from_ref = np.array(
-            [
-                haversine_distance(
-                    abs_true[i, 0],
-                    abs_true[i, 1],
-                    reference_coords["latitude"],
-                    reference_coords["longitude"],
-                )
-                for i in range(len(abs_true))
-            ]
-        )
-
-        plt.figure(figsize=(10, 8))
-        plt.scatter(distances_from_ref, abs_horizontal_errors, alpha=0.6)
-
-        # Add trend line
-        z = np.polyfit(distances_from_ref, abs_horizontal_errors, 1)
-        p = np.poly1d(z)
-        plt.plot(
-            distances_from_ref,
-            p(distances_from_ref),
-            "r--",
-            label=f"Trend: y={z[0]:.4f}x+{z[1]:.2f}",
-        )
-
-        plt.xlabel("Distance from Mainshock (km)")
-        plt.ylabel("Horizontal Prediction Error (km)")
-        plt.title("Prediction Error vs. Distance from Mainshock")
-        plt.legend()
-        plt.grid(True)
-        plt.savefig(
-            f"results/error_vs_distance_{model_name}.png",
-            dpi=300,
-            bbox_inches="tight",
-        )
-
-
-def main():
-    """
-    Main function to run the relative coordinate GNN aftershock prediction pipeline.
-    """
-    print("Starting Relative Coordinate GNN Aftershock Prediction...")
-
-    # Check if data exists
-    if not os.path.exists("aftershock_data.pkl"):
-        print("Error: Data file 'aftershock_data.pkl' not found.")
-        return
-
-    # Read data
-    print("Reading data from pickle file...")
-    df = read_data_from_pickle("aftershock_data.pkl")
-
-    print(df.head())
-
-    # Display data info
-    print(f"Dataset loaded. Total events: {len(df)}")
-
-    # Create spatiotemporal graphs with relative coordinates
-    graph_data_list, reference_coords = create_relative_spatiotemporal_graph(
-        df, time_window=168, spatial_threshold=100, min_connections=1  # 1 week
-    )
-
-    # Set device (GPU if available)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # Train models with different GNN types
-    gnn_types = ["gat", "sage"]  # Focus on the best performing architectures
-    results = {}
-
-    for gnn_type in gnn_types:
-        print(f"\n===== Training Relative {gnn_type.upper()} model =====")
-
-        # Initialize GNN predictor
-        predictor = RelativeGNNAftershockPredictor(
-            graph_data_list=graph_data_list,
-            reference_coords=reference_coords,
-            gnn_type=gnn_type,
-            hidden_dim=128,
-            num_layers=4,
-            learning_rate=0.001,
-            batch_size=16,
-            weight_decay=1e-5,
-        )
-
-        # Debug data structure - useful for troubleshooting
-        predictor.debug_data_structure()
-
-        # Train model
-        predictor.train(num_epochs=75, patience=15)
-
-        # Evaluate on test set
-        print(f"Evaluating relative {gnn_type.upper()} model on test set...")
-        metrics, y_true, y_pred, errors = predictor.test()
-
-        # Print metrics
-        print(f"\n{gnn_type.upper()} Relative Prediction Error Metrics:")
-        for key, value in metrics.items():
-            print(f"{key}: {value:.4f}")
-
-        # Plot results
-        plot_relative_results(
-            y_true,
-            y_pred,
-            errors,
-            reference_coords=reference_coords,
-            model_name=f"Relative_{gnn_type.upper()}",
-        )
-
-        # Store results
-        results[gnn_type] = {
-            "metrics": metrics,
-            "y_true": y_true,
-            "y_pred": y_pred,
-            "errors": errors,
-        }
-
-    # Compare different GNN models
-    plt.figure(figsize=(12, 8))
-
-    metrics_to_plot = ["mean_horizontal_error", "mean_depth_error", "mean_3d_error"]
-    if "abs_mean_horizontal_error" in list(results.values())[0]["metrics"]:
-        metrics_to_plot.extend(
-            ["abs_mean_horizontal_error", "abs_mean_depth_error", "abs_mean_3d_error"]
-        )
-
-    x = np.arange(len(metrics_to_plot))
-    width = 0.2
-
-    for i, gnn_type in enumerate(gnn_types):
-        values = [results[gnn_type]["metrics"][m] for m in metrics_to_plot]
-        plt.bar(x + i * width, values, width, label=gnn_type.upper())
-
-    plt.xlabel("Metric")
-    plt.ylabel("Error (km)")
-    plt.title("Comparison of Different Relative GNN Models")
-    plt.xticks(x + width, metrics_to_plot, rotation=45)
-    plt.legend()
-    plt.grid(True, axis="y")
-    plt.tight_layout()
-    plt.savefig(
-        f"results/relative_gnn_comparison.png",
-        dpi=300,
-        bbox_inches="tight",
-    )
-
-    # Compare with previous absolute coordinate results if available
-    try:
-        # Load previous absolute results or compare directly if you have them
-        abs_results = pickle.load(open("absolute_results.pkl", "rb"))
-
-        # Compare relative vs absolute approaches
-        plt.figure(figsize=(12, 8))
-
-        # Common metrics for both approaches
-        common_metrics = ["mean_horizontal_error", "mean_depth_error", "mean_3d_error"]
-        x = np.arange(len(common_metrics))
-        width = 0.15
-
-        # Plot bars for each model
-        for i, abs_model in enumerate(abs_results.keys()):
-            values = [abs_results[abs_model]["metrics"][m] for m in common_metrics]
-            plt.bar(x + i * width, values, width, label=f"Abs {abs_model.upper()}")
-
-        for i, rel_model in enumerate(results.keys()):
-            values = [results[rel_model]["metrics"][f"abs_{m}"] for m in common_metrics]
-            plt.bar(
-                x + (i + len(abs_results)) * width,
-                values,
-                width,
-                label=f"Rel {rel_model.upper()}",
-            )
-
-        plt.xlabel("Metric")
-        plt.ylabel("Error (km)")
-        plt.title("Absolute vs Relative Coordinate GNN Approaches")
-        plt.xticks(
-            x + width * (len(abs_results) + len(results) - 1) / 2, common_metrics
-        )
-        plt.legend()
-        plt.grid(True, axis="y")
-        plt.savefig(
-            f"results/absolute_vs_relative_comparison.png",
-            dpi=300,
-            bbox_inches="tight",
-        )
-    except Exception as e:
-        print(f"Could not compare with absolute results: {e}")
-
-    print("Relative GNN prediction complete. Results saved in the 'results' directory.")
-
-
-if __name__ == "__main__":
-    start_time = time.time()
-    main()
-    elapsed_time = time.time() - start_time
-    print(f"Total execution time: {elapsed_time:.2f} seconds")

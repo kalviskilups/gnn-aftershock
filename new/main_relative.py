@@ -12,7 +12,7 @@ from datetime import datetime
 # Import from our relative GNN implementation
 from relative_gnn import (
     read_data_from_pickle,
-    create_relative_spatiotemporal_graph,
+    create_causal_spatiotemporal_graph,  # Using the causal version now
     RelativeGNNAftershockPredictor,
     plot_relative_results
 )
@@ -142,12 +142,12 @@ def compare_methods(rel_file="rel_results.pkl", abs_file="abs_results.pkl"):
     print("Comparison visualizations saved to results directory")
 
 def main_func():
-    """Demo of the relative location GNN implementation"""
+    """Demo of the causal relative location GNN implementation"""
     
     # Create the output directory
     os.makedirs("results", exist_ok=True)
     
-    print("Starting relative location GNN demonstration")
+    print("Starting causal relative location GNN demonstration")
     
     # Load the data
     if not os.path.exists("aftershock_data.pkl"):
@@ -156,51 +156,55 @@ def main_func():
     
     # Load the data
     df = read_data_from_pickle("aftershock_data.pkl")
+    
+    # Sort data chronologically but DO NOT shuffle
     df_sorted = df.copy()
     df_sorted["timestamp"] = pd.to_datetime(df["source_origin_time"])
     df_sorted = df_sorted.sort_values("timestamp").drop("timestamp", axis=1)
+    
+    # Just use the sorted dataframe as is - no shuffling!
+    df = df_sorted[2:].reset_index(drop=True)
 
-    df = df_sorted[2:]
-
+    print(df)
 
     print(f"Loaded data with {len(df)} events")
     
-    # Create relative coordinate graphs
-    graph_data_list, reference_coords = create_relative_spatiotemporal_graph(
+    # Create relative coordinate graphs using the causal approach
+    graph_data_list, reference_coords = create_causal_spatiotemporal_graph(
         df,
         time_window=168,  # One week in hours
         spatial_threshold=100,  # 100 km
         min_connections=3
     )
     
-    print(f"Created {len(graph_data_list)} graphs in relative coordinate system")
+    print(f"Created {len(graph_data_list)} causal graphs in relative coordinate system")
     print(f"Reference coordinates: {reference_coords}")
     
-    # Train a simple model with fewer epochs for demonstration
-    model_type = "gat"  # Graph Attention Network
+    # Train a model with our fixed causal approach
+    model_type = "sage"  # Graph Attention Network
     
     predictor = RelativeGNNAftershockPredictor(
         graph_data_list=graph_data_list,
         reference_coords=reference_coords,
         gnn_type=model_type,
-        hidden_dim=128,  # Smaller than full implementation for quick demo
+        hidden_dim=128,
         num_layers=4,
         learning_rate=0.001,
         batch_size=16
     )
     
-    # Debug the data structure
+    # Debug the data structure to verify no leakage
     predictor.debug_data_structure()
     
-    # Train for just 10 epochs for demonstration
+    # Train the model
     predictor.train(num_epochs=75, patience=15)
     
     # Test the model
-    print(f"Testing {model_type.upper()} model...")
+    print(f"Testing causal {model_type.upper()} model...")
     metrics, y_true, y_pred, errors = predictor.test()
     
     # Print metrics
-    print(f"\n{model_type.upper()} Relative Prediction Metrics:")
+    print(f"\nCausal {model_type.upper()} Relative Prediction Metrics:")
     for key, value in metrics.items():
         print(f"{key}: {value:.4f}")
     
@@ -208,7 +212,7 @@ def main_func():
     plot_relative_results(
         y_true, y_pred, errors,
         reference_coords=reference_coords,
-        model_name=f"Demo_{model_type}"
+        model_name=f"Causal_{model_type}"
     )
     
     # Save results for potential comparison
