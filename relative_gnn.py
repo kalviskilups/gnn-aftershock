@@ -141,7 +141,6 @@ def identify_mainshock(df):
     # In a real application, you might want to explicitly select it based on magnitude
     mainshock_idx = df_sorted.index[0]
 
-    print(mainshock_idx)
 
     return mainshock_idx
 
@@ -1447,3 +1446,192 @@ def plot_relative_results(
         dpi=300,
         bbox_inches="tight",
     )
+
+
+def plot_3d_aftershocks(y_true, y_pred, reference_coords, model_name="CausalRelativeGNN"):
+    """
+    Create 3D visualization of aftershock locations showing true vs predicted positions
+    with depth information.
+    
+    Args:
+        y_true: True relative coordinates [ew_km, ns_km, depth_rel]
+        y_pred: Predicted relative coordinates [ew_km, ns_km, depth_rel]
+        reference_coords: Dictionary with reference coordinates for conversion to absolute
+        model_name: Name to use in plot titles and filenames
+    """
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    import numpy as np
+    import os
+    from matplotlib.lines import Line2D
+    
+    # Create output directory if it doesn't exist
+    os.makedirs("results", exist_ok=True)
+    
+    # Convert to absolute coordinates for plotting
+    abs_true = np.array(
+        [
+            relative_to_absolute_coordinates(
+                y_true[i, 0], y_true[i, 1], y_true[i, 2], reference_coords
+            )
+            for i in range(len(y_true))
+        ]
+    )
+
+    abs_pred = np.array(
+        [
+            relative_to_absolute_coordinates(
+                y_pred[i, 0], y_pred[i, 1], y_pred[i, 2], reference_coords
+            )
+            for i in range(len(y_pred))
+        ]
+    )
+    
+    # Create figure with 3D axes
+    fig = plt.figure(figsize=(16, 14))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Plot true locations - blue
+    ax.scatter(
+        abs_true[:, 1],  # longitude
+        abs_true[:, 0],  # latitude
+        abs_true[:, 2],  # depth
+        c='blue', 
+        s=30, 
+        alpha=0.6,
+        label="True Location"
+    )
+    
+    # Plot predicted locations - red
+    ax.scatter(
+        abs_pred[:, 1],  # longitude
+        abs_pred[:, 0],  # latitude
+        abs_pred[:, 2],  # depth
+        c='red', 
+        s=30, 
+        alpha=0.6,
+        label="Predicted Location"
+    )
+    
+    # Draw lines connecting true and predicted points
+    for i in range(len(abs_true)):
+        ax.plot(
+            [abs_true[i, 1], abs_pred[i, 1]],  # longitude
+            [abs_true[i, 0], abs_pred[i, 0]],  # latitude
+            [abs_true[i, 2], abs_pred[i, 2]],  # depth
+            'k-', 
+            alpha=0.15
+        )
+    
+    # Plot reference point (mainshock)
+    ax.scatter(
+        [reference_coords["longitude"]],
+        [reference_coords["latitude"]],
+        [reference_coords["depth"]],
+        c='green', 
+        s=100, 
+        marker='*',
+        label="Reference (Mainshock)"
+    )
+    
+    # Customize the plot
+    ax.set_xlabel('Longitude')
+    ax.set_ylabel('Latitude')
+    ax.set_zlabel('Depth (km)')
+    
+    # Invert z-axis so that depth increases downward (as is standard in seismology)
+    ax.invert_zaxis()
+    
+    # Add a title
+    ax.set_title(f'3D Aftershock Location Visualization - {model_name}')
+    
+    # Add grid lines for better depth perception
+    ax.grid(True)
+    
+    # Add legend
+    ax.legend()
+    
+    # Adjust view angle for better visualization
+    ax.view_init(elev=30, azim=45)
+    
+    # Save the figure
+    plt.savefig(
+        f"results/3d_location_visualization_{model_name}.png",
+        dpi=300,
+        bbox_inches="tight"
+    )
+    
+    # Create an alternative view (top-down view with color-coded depth)
+    fig = plt.figure(figsize=(12, 10))
+    ax = fig.add_subplot(111)
+    
+    # Plot true and predicted locations with depth as color
+    sc1 = ax.scatter(
+        abs_true[:, 1],  # longitude
+        abs_true[:, 0],  # latitude
+        c=abs_true[:, 2],  # depth as color
+        cmap='Blues',
+        s=50,
+        alpha=0.7,
+        edgecolors='navy',
+        label="True"
+    )
+    
+    sc2 = ax.scatter(
+        abs_pred[:, 1],  # longitude
+        abs_pred[:, 0],  # latitude
+        c=abs_pred[:, 2],  # depth as color
+        cmap='Reds',
+        s=50,
+        alpha=0.7,
+        edgecolors='darkred',
+        label="Predicted"
+    )
+    
+    # Add color bars
+    cb1 = plt.colorbar(sc1, ax=ax, pad=0.01)
+    cb1.set_label('True Depth (km)')
+    
+    cb2 = plt.colorbar(sc2, ax=ax, pad=0.06)
+    cb2.set_label('Predicted Depth (km)')
+    
+    # Connect corresponding true and predicted points
+    for i in range(len(abs_true)):
+        ax.plot(
+            [abs_true[i, 1], abs_pred[i, 1]],
+            [abs_true[i, 0], abs_pred[i, 0]],
+            'k-', 
+            alpha=0.15
+        )
+    
+    # Plot reference point (mainshock)
+    ax.scatter(
+        [reference_coords["longitude"]],
+        [reference_coords["latitude"]],
+        c='green', 
+        s=150, 
+        marker='*',
+        edgecolors='darkgreen'
+    )
+    
+    # Custom legend (since we're using colormaps for the main scatters)
+    legend_elements = [
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='navy', markersize=10, label='True Location'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='darkred', markersize=10, label='Predicted Location'),
+        Line2D([0], [0], marker='*', color='w', markerfacecolor='green', markersize=15, label='Mainshock')
+    ]
+    ax.legend(handles=legend_elements, loc='best')
+    
+    ax.set_xlabel('Longitude')
+    ax.set_ylabel('Latitude')
+    ax.set_title(f'Map View with Depth-Coded Colors - {model_name}')
+    ax.grid(True)
+    
+    # Save the figure
+    plt.savefig(
+        f"results/depth_coded_map_{model_name}.png",
+        dpi=300,
+        bbox_inches="tight"
+    )
+    
+    print(f"Created 3D visualizations for {model_name}")

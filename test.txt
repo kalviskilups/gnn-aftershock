@@ -1,1 +1,0 @@
-python compare_models.py --hidden_channels 32 --num_layers 2 --dropout 0.4 --lr 0.001 --batch_size 16 --sequence_length 15 --epochs 300 --patience 15 --distance_threshold 100
