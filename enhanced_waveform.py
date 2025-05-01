@@ -8,6 +8,9 @@ import os
 import time
 from datetime import datetime
 import scipy
+import argparse
+import pywt
+from scipy import signal
 
 import torch
 import torch.nn as nn
@@ -44,7 +47,7 @@ def read_data_from_pickle(file_path):
 
 def extract_waveform_features(waveform):
     """
-    Extract time and frequency domain features from waveform data.
+    Extract basic time and frequency domain features from waveform data.
     """
     features = []
     for component in range(waveform.shape[0]):
@@ -86,6 +89,206 @@ def extract_waveform_features(waveform):
             )
 
     return np.array(features)
+
+
+def extract_enhanced_waveform_features(waveform, sampling_rate=100):
+    """
+    Extract enhanced waveform features including wavelet transforms, 
+    phase-specific features, and temporal information.
+    
+    Args:
+        waveform: 2D array with shape [components, samples]
+        sampling_rate: Sampling rate of the waveform in Hz (default: 100)
+        
+    Returns:
+        Array of enhanced waveform features
+    """
+    all_features = []
+    
+    for component in range(waveform.shape[0]):
+        signal_data = waveform[component]
+        component_features = []
+        
+        # 1. Basic statistical features (keep these from the original)
+        component_features.extend([
+            np.max(np.abs(signal_data)),
+            np.mean(np.abs(signal_data)),
+            np.std(signal_data),
+            scipy.stats.skew(signal_data),
+            scipy.stats.kurtosis(signal_data),
+        ])
+        
+        # 2. Wavelet transform features
+        # Perform wavelet decomposition
+        try:
+            wavelet = 'db4'  # Daubechies wavelet
+            coeffs = pywt.wavedec(signal_data, wavelet, level=5)
+            
+            # Extract features from each wavelet level
+            for i, coeff in enumerate(coeffs):
+                # Energy of wavelet coefficients at this level
+                energy = np.sum(coeff**2) / len(coeff)
+                # Standard deviation of wavelet coefficients
+                std_dev = np.std(coeff)
+                # Mean absolute value
+                mean_abs = np.mean(np.abs(coeff))
+                
+                component_features.extend([energy, std_dev, mean_abs])
+        except Exception as e:
+            # If wavelet transform fails, add zeros as placeholders
+            # For 5 levels, 3 features per level
+            component_features.extend([0] * (5 * 3))
+            print(f"Wavelet transform failed: {e}")
+        
+        # 3. Phase-specific features (P and S wave detection)
+        # We'll use STA/LTA (Short Time Average / Long Time Average) method
+        # to detect major phase arrivals
+        
+        # STA/LTA parameters
+        sta_length = int(0.5 * sampling_rate)  # 0.5 second window
+        lta_length = int(5 * sampling_rate)    # 5 second window
+        
+        # Calculate STA/LTA ratio
+        sta = np.zeros_like(signal_data)
+        lta = np.zeros_like(signal_data)
+        
+        # Compute STA and LTA
+        for i in range(len(signal_data)):
+            sta_start = max(0, i - sta_length)
+            lta_start = max(0, i - lta_length)
+            
+            sta[i] = np.mean(signal_data[sta_start:i+1]**2)
+            lta[i] = np.mean(signal_data[lta_start:i+1]**2)
+        
+        # Avoid division by zero
+        lta[lta == 0] = 1e-10
+        
+        # STA/LTA ratio
+        sta_lta_ratio = sta / lta
+        
+        # Find peaks in STA/LTA ratio (potential phase arrivals)
+        peaks, _ = signal.find_peaks(sta_lta_ratio, height=1.5, distance=int(sampling_rate * 0.5))
+        
+        if len(peaks) >= 2:
+            # Assuming first major peak is P wave, second is S wave
+            p_wave_idx = peaks[0]
+            s_wave_idx = peaks[1]
+            
+            # P-wave features
+            p_wave_segment = signal_data[max(0, p_wave_idx-int(0.2*sampling_rate)):
+                                        min(len(signal_data), p_wave_idx+int(0.5*sampling_rate))]
+            
+            # S-wave features
+            s_wave_segment = signal_data[max(0, s_wave_idx-int(0.2*sampling_rate)):
+                                        min(len(signal_data), s_wave_idx+int(0.8*sampling_rate))]
+            
+            # Compute features for each phase
+            if len(p_wave_segment) > 0:
+                p_amplitude = np.max(np.abs(p_wave_segment))
+                p_energy = np.sum(p_wave_segment**2)
+                p_freq = np.mean(np.abs(np.fft.rfft(p_wave_segment)))
+            else:
+                p_amplitude, p_energy, p_freq = 0, 0, 0
+                
+            if len(s_wave_segment) > 0:
+                s_amplitude = np.max(np.abs(s_wave_segment))
+                s_energy = np.sum(s_wave_segment**2)
+                s_freq = np.mean(np.abs(np.fft.rfft(s_wave_segment)))
+            else:
+                s_amplitude, s_energy, s_freq = 0, 0, 0
+                
+            # S-P time difference (important seismic feature)
+            if p_wave_idx < s_wave_idx:
+                sp_time_diff = (s_wave_idx - p_wave_idx) / sampling_rate
+            else:
+                sp_time_diff = 0
+        else:
+            # If we can't identify distinct phases, use zeros
+            p_amplitude, p_energy, p_freq = 0, 0, 0
+            s_amplitude, s_energy, s_freq = 0, 0, 0
+            sp_time_diff = 0
+        
+        # Add phase features
+        component_features.extend([
+            p_amplitude, p_energy, p_freq,
+            s_amplitude, s_energy, s_freq,
+            sp_time_diff
+        ])
+        
+        # 4. Temporal pattern features
+        # Divide signal into segments and extract features to preserve temporal evolution
+        num_segments = 5
+        segment_length = len(signal_data) // num_segments
+        
+        for i in range(num_segments):
+            start = i * segment_length
+            end = (i + 1) * segment_length if i < num_segments - 1 else len(signal_data)
+            segment = signal_data[start:end]
+            
+            if len(segment) > 0:
+                # Basic features for each segment
+                segment_max = np.max(np.abs(segment))
+                segment_energy = np.sum(segment**2) / len(segment)
+                
+                # Rate of energy change (derivative of energy)
+                if i > 0:
+                    prev_segment = signal_data[(i-1)*segment_length:i*segment_length]
+                    prev_energy = np.sum(prev_segment**2) / len(prev_segment)
+                    energy_derivative = segment_energy - prev_energy
+                else:
+                    energy_derivative = 0
+                
+                component_features.extend([segment_max, segment_energy, energy_derivative])
+            else:
+                component_features.extend([0, 0, 0])
+        
+        # 5. Frequency domain enhancements
+        # Spectral centroid and bandwidth
+        fft = np.abs(np.fft.rfft(signal_data))
+        freqs = np.fft.rfftfreq(len(signal_data), d=1/sampling_rate)
+        
+        if np.sum(fft) > 0:
+            spectral_centroid = np.sum(freqs * fft) / np.sum(fft)
+            spectral_bandwidth = np.sqrt(np.sum(((freqs - spectral_centroid)**2) * fft) / np.sum(fft))
+        else:
+            spectral_centroid, spectral_bandwidth = 0, 0
+            
+        component_features.extend([spectral_centroid, spectral_bandwidth])
+        
+        # 6. Spectral shape features
+        if len(fft) > 0:
+            # Spectral roll-off (frequency below which 85% of spectral energy is contained)
+            cumsum = np.cumsum(fft)
+            rolloff_idx = np.where(cumsum >= 0.85 * cumsum[-1])[0]
+            rolloff = freqs[rolloff_idx[0]] if len(rolloff_idx) > 0 else 0
+            
+            # Spectral flatness (Wiener entropy)
+            geometric_mean = np.exp(np.mean(np.log(fft + 1e-10)))
+            arithmetic_mean = np.mean(fft)
+            spectral_flatness = geometric_mean / (arithmetic_mean + 1e-10)
+            
+            # Spectral flux (frame-to-frame spectral difference)
+            # FIX: Ensure both halves are the same length
+            middle = len(fft) // 2
+            first_half = fft[:middle]
+            # Make sure second_half has same length as first_half
+            second_half = fft[middle:middle*2] if middle*2 <= len(fft) else np.pad(fft[middle:], (0, middle - (len(fft) - middle)))
+            
+            if len(first_half) == len(second_half):
+                spectral_flux = np.sum((second_half - first_half)**2)
+            else:
+                # Fallback if lengths still don't match somehow
+                spectral_flux = 0
+                print(f"Warning: Spectral flux calculation skipped - mismatched lengths {len(first_half)} vs {len(second_half)}")
+        else:
+            rolloff, spectral_flatness, spectral_flux = 0, 0, 0
+            
+        component_features.extend([rolloff, spectral_flatness, spectral_flux])
+        
+        # Add component features to the full feature set
+        all_features.extend(component_features)
+    
+    return np.array(all_features)
 
 
 def haversine_distance(lat1, lon1, lat2, lon2):
@@ -141,6 +344,7 @@ def identify_mainshock(df):
     # In a real application, you might want to explicitly select it based on magnitude
     mainshock_idx = df_sorted.index[0]
 
+    print(f"Identified mainshock at index {mainshock_idx}")
 
     return mainshock_idx
 
@@ -174,15 +378,19 @@ def relative_haversine_loss(y_pred, y_true):
     return torch.mean(dist_3d)
 
 
-def create_causal_spatiotemporal_graph(
-    df, mainshock_idx=None, time_window=24, spatial_threshold=100, min_connections=1
+def create_causal_spatiotemporal_graph_configurable(
+    df, 
+    mainshock_idx=None, 
+    time_window=24, 
+    spatial_threshold=100, 
+    min_connections=1,
+    use_waveform_features=True,      # Parameter to toggle waveform features
+    enhanced_waveform=False,         # Parameter for enhanced features
+    sampling_rate=100                # Sampling rate for waveform processing
 ):
     """
     Create strictly causal spatiotemporal graphs using relative coordinate system.
-    This version ensures no data leakage by:
-    1. Only using past events as context for each target event
-    2. Excluding the target event's true coordinates from its feature vector
-    3. Maintaining strict temporal ordering
+    This enhanced version can use advanced waveform features.
 
     Args:
         df: DataFrame with aftershock information
@@ -190,6 +398,9 @@ def create_causal_spatiotemporal_graph(
         time_window: Time window in hours to consider events connected
         spatial_threshold: Maximum distance in km between connected events
         min_connections: Minimum number of connections required to create a graph
+        use_waveform_features: Whether to include waveform features (if False, uses zeros instead)
+        enhanced_waveform: Whether to use enhanced waveform features
+        sampling_rate: Sampling rate of waveform data in Hz
 
     Returns:
         List of PyTorch Geometric Data objects, reference coordinates for converting back
@@ -197,6 +408,7 @@ def create_causal_spatiotemporal_graph(
     print(
         f"Creating causal relative spatiotemporal graphs (time window: {time_window}h, spatial threshold: {spatial_threshold}km)..."
     )
+    print(f"Waveform features: {'Enhanced' if use_waveform_features and enhanced_waveform else 'Basic' if use_waveform_features else 'Disabled'}")
 
     # Identify mainshock if not provided
     if mainshock_idx is None:
@@ -247,11 +459,29 @@ def create_causal_spatiotemporal_graph(
     df_sorted["ns_rel_km"] = relative_coords[:, 1]
     df_sorted["depth_rel_km"] = relative_coords[:, 2]
 
-    # Extract waveform features once for all events
-    print("Extracting waveform features for nodes...")
-    waveform_features = np.array(
-        [extract_waveform_features(w) for w in tqdm(df_sorted["waveform"])]
-    )
+    # Extract waveform features or use zeros as placeholders
+    if use_waveform_features:
+        if enhanced_waveform:
+            print("Extracting enhanced waveform features for nodes...")
+            waveform_features = np.array([
+                extract_enhanced_waveform_features(w, sampling_rate) 
+                for w in tqdm(df_sorted["waveform"])
+            ])
+        else:
+            print("Extracting basic waveform features for nodes...")
+            waveform_features = np.array([
+                extract_waveform_features(w) for w in tqdm(df_sorted["waveform"])
+            ])
+    else:
+        print("Skipping waveform features (using zeros instead)...")
+        # Get the expected waveform feature dimension by extracting one example
+        if enhanced_waveform:
+            sample_features = extract_enhanced_waveform_features(df_sorted["waveform"].iloc[0], sampling_rate)
+        else:
+            sample_features = extract_waveform_features(df_sorted["waveform"].iloc[0])
+        feature_dim = len(sample_features)
+        # Create array of zeros with matching dimensions
+        waveform_features = np.zeros((len(df_sorted), feature_dim))
 
     # Create graph data objects
     graph_data_list = []
@@ -550,7 +780,7 @@ def calculate_prediction_errors_relative(y_true, y_pred, reference_coords=None):
         )
 
     # Return only relative errors if no reference provided
-    return metrics, horizontal_errors, depth_errors, euclidean_3d_errors
+    return metrics, (horizontal_errors, depth_errors, euclidean_3d_errors)
 
 
 class CausalGNN(torch.nn.Module):
@@ -733,8 +963,6 @@ class RelativeGNNAftershockPredictor:
         learning_rate=0.001,
         batch_size=32,
         weight_decay=1e-5,
-        model_class=None,  # New parameter: optional custom model class
-        model_kwargs=None,  # New parameter: optional additional model args
     ):
         self.graph_data_list = graph_data_list
         self.reference_coords = reference_coords
@@ -744,8 +972,6 @@ class RelativeGNNAftershockPredictor:
         self.learning_rate = learning_rate
         self.batch_size = batch_size
         self.weight_decay = weight_decay
-        self.model_class = model_class  # Store custom model class
-        self.model_kwargs = model_kwargs or {}  # Store additional model args
 
         # Split data into train/val/test using chronological splitting
         self.train_data, self.val_data, self.test_data = self._chronological_split()
@@ -760,28 +986,15 @@ class RelativeGNNAftershockPredictor:
                 else 0
             )
 
-            # Initialize model - using custom model class if provided
-            if self.model_class is not None:
-                # Use the provided custom model class with additional kwargs
-                self.model = self.model_class(
-                    num_node_features=num_features,
-                    edge_dim=edge_dim,
-                    hidden_dim=hidden_dim,
-                    output_dim=3,  # [ew_km, ns_km, depth_rel]
-                    num_layers=num_layers,
-                    gnn_type=gnn_type,
-                    **self.model_kwargs  # Pass additional model args
-                )
-            else:
-                # Use the default CausalGNN model
-                self.model = CausalGNN(
-                    num_node_features=num_features,
-                    edge_dim=edge_dim,
-                    hidden_dim=hidden_dim,
-                    output_dim=3,  # [ew_km, ns_km, depth_rel]
-                    num_layers=num_layers,
-                    gnn_type=gnn_type,
-                )
+            # Initialize model
+            self.model = CausalGNN(
+                num_node_features=num_features,
+                edge_dim=edge_dim,
+                hidden_dim=hidden_dim,
+                output_dim=3,  # [ew_km, ns_km, depth_rel]
+                num_layers=num_layers,
+                gnn_type=gnn_type,
+            )
 
             # Loss and optimizer
             self.criterion = relative_haversine_loss
@@ -804,7 +1017,7 @@ class RelativeGNNAftershockPredictor:
             self.val_loader = PyGDataLoader(self.val_data, batch_size=batch_size)
             self.test_loader = PyGDataLoader(self.test_data, batch_size=batch_size)
 
-    def _chronological_split(self, val_ratio=0.1, test_ratio=0.1):
+    def _chronological_split(self, val_ratio=0.15, test_ratio=0.15):
         """Split graph data chronologically into train/val/test sets"""
         n = len(self.graph_data_list)
         
@@ -998,15 +1211,8 @@ class RelativeGNNAftershockPredictor:
             return metrics, y_true, y_pred, (rel_errors, abs_errors)
         else:
             # Only relative coordinate errors
-            metrics, horizontal_errors, depth_errors, euclidean_3d_errors = (
-                calculate_prediction_errors_relative(y_true, y_pred)
-            )
-            return (
-                metrics,
-                y_true,
-                y_pred,
-                (horizontal_errors, depth_errors, euclidean_3d_errors),
-            )
+            metrics, errors = calculate_prediction_errors_relative(y_true, y_pred)
+            return metrics, y_true, y_pred, errors
 
     def test(self):
         self.model.eval()
@@ -1064,15 +1270,8 @@ class RelativeGNNAftershockPredictor:
             return metrics, y_true, y_pred, (rel_errors, abs_errors)
         else:
             # Only relative coordinate errors
-            metrics, horizontal_errors, depth_errors, euclidean_3d_errors = (
-                calculate_prediction_errors_relative(y_true, y_pred)
-            )
-            return (
-                metrics,
-                y_true,
-                y_pred,
-                (horizontal_errors, depth_errors, euclidean_3d_errors),
-            )
+            metrics, errors = calculate_prediction_errors_relative(y_true, y_pred)
+            return metrics, y_true, y_pred, errors
 
     def train(self, num_epochs=100, patience=10):
         """Train the model with early stopping"""
@@ -1476,10 +1675,7 @@ def plot_3d_aftershocks(y_true, y_pred, reference_coords, model_name="CausalRela
         reference_coords: Dictionary with reference coordinates for conversion to absolute
         model_name: Name to use in plot titles and filenames
     """
-    import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d import Axes3D
-    import numpy as np
-    import os
     from matplotlib.lines import Line2D
     
     # Create output directory if it doesn't exist
@@ -1505,7 +1701,7 @@ def plot_3d_aftershocks(y_true, y_pred, reference_coords, model_name="CausalRela
     )
     
     # Create figure with 3D axes
-    fig = plt.figure(figsize=(16, 14))
+    fig = plt.figure(figsize=(12, 10))
     ax = fig.add_subplot(111, projection='3d')
     
     # Plot true locations - blue
@@ -1651,4 +1847,859 @@ def plot_3d_aftershocks(y_true, y_pred, reference_coords, model_name="CausalRela
         bbox_inches="tight"
     )
     
-    print(f"Created 3D visualizations for {model_name}")
+    # Create depth profile visualization (showing along-strike and dip directions)
+    fig = plt.figure(figsize=(16, 8))
+    
+    # First subplot: Along-strike view (longitude vs depth)
+    ax1 = fig.add_subplot(121)
+    ax1.scatter(abs_true[:, 1], abs_true[:, 2], c='blue', s=30, alpha=0.6, label="True")
+    ax1.scatter(abs_pred[:, 1], abs_pred[:, 2], c='red', s=30, alpha=0.6, label="Predicted")
+    
+    # Connect corresponding points
+    for i in range(len(abs_true)):
+        ax1.plot(
+            [abs_true[i, 1], abs_pred[i, 1]],
+            [abs_true[i, 2], abs_pred[i, 2]],
+            'k-', 
+            alpha=0.15
+        )
+    
+    # Plot mainshock
+    ax1.scatter(
+        [reference_coords["longitude"]],
+        [reference_coords["depth"]],
+        c='green', 
+        s=100, 
+        marker='*',
+        label="Mainshock"
+    )
+    
+    ax1.set_xlabel('Longitude')
+    ax1.set_ylabel('Depth (km)')
+    ax1.invert_yaxis()  # Invert y axis to show depth increasing downward
+    ax1.set_title('Along-Strike View (Longitude vs Depth)')
+    ax1.grid(True)
+    ax1.legend()
+    
+    # Second subplot: Dip view (latitude vs depth)
+    ax2 = fig.add_subplot(122)
+    ax2.scatter(abs_true[:, 0], abs_true[:, 2], c='blue', s=30, alpha=0.6, label="True")
+    ax2.scatter(abs_pred[:, 0], abs_pred[:, 2], c='red', s=30, alpha=0.6, label="Predicted")
+    
+    # Connect corresponding points
+    for i in range(len(abs_true)):
+        ax2.plot(
+            [abs_true[i, 0], abs_pred[i, 0]],
+            [abs_true[i, 2], abs_pred[i, 2]],
+            'k-', 
+            alpha=0.15
+        )
+    
+    # Plot mainshock
+    ax2.scatter(
+        [reference_coords["latitude"]],
+        [reference_coords["depth"]],
+        c='green', 
+        s=100, 
+        marker='*',
+        label="Mainshock"
+    )
+    
+    ax2.set_xlabel('Latitude')
+    ax2.set_ylabel('Depth (km)')
+    ax2.invert_yaxis()  # Invert y axis to show depth increasing downward
+    ax2.set_title('Dip View (Latitude vs Depth)')
+    ax2.grid(True)
+    ax2.legend()
+    
+    plt.tight_layout()
+    plt.savefig(
+        f"results/depth_profiles_{model_name}.png",
+        dpi=300,
+        bbox_inches="tight"
+    )
+    
+    print(f"Created 3D and depth profile visualizations for {model_name}")
+
+
+def run_waveform_comparison_experiment(df, model_type="gat", num_epochs=50, patience=10):
+    """
+    Run experiments comparing model performance with different waveform feature approaches.
+    
+    Args:
+        df: DataFrame with aftershock information
+        model_type: Type of GNN to use (default: "gat")
+        num_epochs: Maximum number of training epochs
+        patience: Early stopping patience
+        
+    Returns:
+        Dictionary with results for all models
+    """
+    print("Running waveform features comparison experiment...")
+    
+    # Create output directory
+    os.makedirs("results/waveform_comparison", exist_ok=True)
+    
+    results = {}
+    
+    # Run experiment with enhanced waveform features
+    print("\n=== With Enhanced Waveform Features ===")
+    graph_data_list, reference_coords = create_causal_spatiotemporal_graph_configurable(
+        df,
+        time_window=120,
+        spatial_threshold=75,
+        min_connections=5,
+        use_waveform_features=True,
+        enhanced_waveform=True
+    )
+    
+    predictor_with_enhanced = RelativeGNNAftershockPredictor(
+        graph_data_list=graph_data_list,
+        reference_coords=reference_coords,
+        gnn_type=model_type,
+        hidden_dim=128,
+        num_layers=3,
+        learning_rate=0.0026154033981211277,
+        batch_size=8,
+        weight_decay=6.4617557814088705e-06
+    )
+    
+    # Train the model
+    predictor_with_enhanced.train(num_epochs=num_epochs, patience=patience)
+    
+    # Test the model
+    metrics_enhanced, y_true_enhanced, y_pred_enhanced, errors_enhanced = predictor_with_enhanced.test()
+    
+    # Store results
+    results["enhanced_waveform"] = {
+        "metrics": metrics_enhanced,
+        "y_true": y_true_enhanced,
+        "y_pred": y_pred_enhanced,
+        "errors": errors_enhanced
+    }
+    
+    # Print metrics
+    print(f"\nMetrics with enhanced waveform features:")
+    for key, value in metrics_enhanced.items():
+        print(f"{key}: {value:.4f}")
+    
+    # Create visualizations for model with enhanced waveform features
+    plot_relative_results(
+        y_true_enhanced, y_pred_enhanced, errors_enhanced,
+        reference_coords=reference_coords,
+        model_name=f"{model_type}_enhanced_waveform"
+    )
+    
+    # Create 3D visualization
+    plot_3d_aftershocks(
+        y_true_enhanced, y_pred_enhanced,
+        reference_coords=reference_coords,
+        model_name=f"{model_type}_enhanced_waveform"
+    )
+    
+    # Run experiment with basic waveform features
+    print("\n=== With Basic Waveform Features ===")
+    graph_data_list, reference_coords = create_causal_spatiotemporal_graph_configurable(
+        df,
+        time_window=120,
+        spatial_threshold=75,
+        min_connections=5,
+        use_waveform_features=True,
+        enhanced_waveform=False
+    )
+    
+    predictor_with_basic = RelativeGNNAftershockPredictor(
+        graph_data_list=graph_data_list,
+        reference_coords=reference_coords,
+        gnn_type=model_type,
+        hidden_dim=128,
+        num_layers=3,
+        learning_rate=0.0026154033981211277,
+        batch_size=8,
+        weight_decay=6.4617557814088705e-06
+    )
+    
+    # Train the model
+    predictor_with_basic.train(num_epochs=num_epochs, patience=patience)
+    
+    # Test the model
+    metrics_basic, y_true_basic, y_pred_basic, errors_basic = predictor_with_basic.test()
+    
+    # Store results
+    results["basic_waveform"] = {
+        "metrics": metrics_basic,
+        "y_true": y_true_basic,
+        "y_pred": y_pred_basic,
+        "errors": errors_basic
+    }
+    
+    # Print metrics
+    print(f"\nMetrics with basic waveform features:")
+    for key, value in metrics_basic.items():
+        print(f"{key}: {value:.4f}")
+    
+    # Create visualizations for model with basic waveform features
+    plot_relative_results(
+        y_true_basic, y_pred_basic, errors_basic,
+        reference_coords=reference_coords,
+        model_name=f"{model_type}_basic_waveform"
+    )
+    
+    # Create 3D visualization
+    plot_3d_aftershocks(
+        y_true_basic, y_pred_basic,
+        reference_coords=reference_coords,
+        model_name=f"{model_type}_basic_waveform"
+    )
+    
+    # Run experiment without waveform features
+    print("\n=== Without Waveform Features ===")
+    graph_data_list, reference_coords = create_causal_spatiotemporal_graph_configurable(
+        df,
+        time_window=120,
+        spatial_threshold=75,
+        min_connections=5,
+        use_waveform_features=False
+    )
+    
+    predictor_without_waveform = RelativeGNNAftershockPredictor(
+        graph_data_list=graph_data_list,
+        reference_coords=reference_coords,
+        gnn_type=model_type,
+        hidden_dim=128,
+        num_layers=3,
+        learning_rate=0.0026154033981211277,
+        batch_size=8,
+        weight_decay=6.4617557814088705e-06
+    )
+    
+    # Train the model
+    predictor_without_waveform.train(num_epochs=num_epochs, patience=patience)
+    
+    # Test the model
+    metrics_without, y_true_without, y_pred_without, errors_without = predictor_without_waveform.test()
+    
+    # Store results
+    results["without_waveform"] = {
+        "metrics": metrics_without,
+        "y_true": y_true_without,
+        "y_pred": y_pred_without,
+        "errors": errors_without
+    }
+    
+    # Print metrics
+    print(f"\nMetrics without waveform features:")
+    for key, value in metrics_without.items():
+        print(f"{key}: {value:.4f}")
+    
+    # Create visualizations for model without waveform features
+    plot_relative_results(
+        y_true_without, y_pred_without, errors_without,
+        reference_coords=reference_coords,
+        model_name=f"{model_type}_without_waveform"
+    )
+    
+    # Create 3D visualization
+    plot_3d_aftershocks(
+        y_true_without, y_pred_without,
+        reference_coords=reference_coords,
+        model_name=f"{model_type}_without_waveform"
+    )
+    
+    # Compare results
+    compare_enhanced_waveform_results(results, model_type, reference_coords)
+    
+    # Save results
+    with open(f"results/waveform_comparison/waveform_comparison_results_{model_type}.pkl", "wb") as f:
+        pickle.dump(results, f)
+    
+    return results
+
+
+def compare_enhanced_waveform_results(results, model_type, reference_coords):
+    """
+    Create visualizations comparing model performance with enhanced, basic, and no waveform features.
+    
+    Args:
+        results: Dictionary containing results from all experiments
+        model_type: Type of GNN model used
+        reference_coords: Reference coordinates for conversion to absolute
+    """
+    from matplotlib.lines import Line2D
+    
+    # Create output directory
+    os.makedirs("results/waveform_comparison", exist_ok=True)
+    
+    # Extract metrics
+    metrics_enhanced = results["enhanced_waveform"]["metrics"]
+    metrics_basic = results["basic_waveform"]["metrics"]
+    metrics_without = results["without_waveform"]["metrics"]
+    
+    # Extract errors
+    if reference_coords is not None:
+        rel_errors_enhanced, abs_errors_enhanced = results["enhanced_waveform"]["errors"]
+        rel_errors_basic, abs_errors_basic = results["basic_waveform"]["errors"]
+        rel_errors_without, abs_errors_without = results["without_waveform"]["errors"]
+        
+        # Extract components
+        horiz_err_enhanced, depth_err_enhanced, err_3d_enhanced = abs_errors_enhanced
+        horiz_err_basic, depth_err_basic, err_3d_basic = abs_errors_basic
+        horiz_err_without, depth_err_without, err_3d_without = abs_errors_without
+    else:
+        horiz_err_enhanced, depth_err_enhanced, err_3d_enhanced = results["enhanced_waveform"]["errors"]
+        horiz_err_basic, depth_err_basic, err_3d_basic = results["basic_waveform"]["errors"]
+        horiz_err_without, depth_err_without, err_3d_without = results["without_waveform"]["errors"]
+    
+    # 1. Compare metrics in a bar chart
+    plt.figure(figsize=(14, 8))
+    
+    # Select key metrics to compare
+    key_metrics = [
+        "mean_horizontal_error", "median_horizontal_error", 
+        "mean_depth_error", "median_depth_error",
+        "mean_3d_error", "median_3d_error"
+    ]
+    
+    # If we have absolute metrics, use those
+    if "abs_mean_horizontal_error" in metrics_enhanced:
+        key_metrics = [
+            "abs_mean_horizontal_error", "abs_median_horizontal_error", 
+            "abs_mean_depth_error", "abs_median_depth_error",
+            "abs_mean_3d_error", "abs_median_3d_error"
+        ]
+    
+    # Readable metric names
+    metric_labels = [
+        "Mean Horizontal", "Median Horizontal", 
+        "Mean Depth", "Median Depth",
+        "Mean 3D", "Median 3D"
+    ]
+    
+    x = np.arange(len(key_metrics))
+    width = 0.25
+    
+    enhanced_values = [metrics_enhanced[k] for k in key_metrics]
+    basic_values = [metrics_basic[k] for k in key_metrics]
+    without_values = [metrics_without[k] for k in key_metrics]
+    
+    plt.bar(x - width, enhanced_values, width, label='Enhanced Waveform', color='green', alpha=0.7)
+    plt.bar(x, basic_values, width, label='Basic Waveform', color='blue', alpha=0.7)
+    plt.bar(x + width, without_values, width, label='No Waveform', color='red', alpha=0.7)
+    
+    plt.xlabel('Metric')
+    plt.ylabel('Error (km)')
+    plt.title(f'Error Metrics Comparison: Enhanced vs Basic vs No Waveform Features ({model_type.upper()})')
+    plt.xticks(x, metric_labels, rotation=45)
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # Add percentage improvement text (enhanced vs no waveform)
+    for i, (enh_val, no_val) in enumerate(zip(enhanced_values, without_values)):
+        if no_val > 0:  # Avoid division by zero
+            improvement = (no_val - enh_val) / no_val * 100
+            color = 'green' if improvement > 0 else 'red'
+            plt.text(i - width, max(enh_val, no_val) + 0.5, 
+                    f"{improvement:.1f}%", 
+                    color=color, 
+                    ha='center', 
+                    fontweight='bold')
+    
+    plt.tight_layout()
+    plt.savefig(f"results/waveform_comparison/metrics_comparison_{model_type}.png", dpi=300, bbox_inches="tight")
+    
+    # 2. Compare error distributions with boxplots
+    plt.figure(figsize=(18, 6))
+    
+    # Horizontal error comparison
+    plt.subplot(1, 3, 1)
+    plt.boxplot([horiz_err_enhanced, horiz_err_basic, horiz_err_without], 
+                labels=['Enhanced Waveform', 'Basic Waveform', 'No Waveform'],
+                patch_artist=True,
+                boxprops=[
+                    dict(facecolor='lightgreen'),
+                    dict(facecolor='lightblue'),
+                    dict(facecolor='salmon')
+                ],
+                flierprops=dict(marker='o', markerfacecolor='red', markersize=3))
+    plt.ylabel('Error (km)')
+    plt.title('Horizontal Error')
+    plt.grid(True, linestyle='--', alpha=0.5)
+    
+    # Depth error comparison
+    plt.subplot(1, 3, 2)
+    plt.boxplot([depth_err_enhanced, depth_err_basic, depth_err_without], 
+                labels=['Enhanced Waveform', 'Basic Waveform', 'No Waveform'],
+                patch_artist=True,
+                boxprops=[
+                    dict(facecolor='lightgreen'),
+                    dict(facecolor='lightblue'),
+                    dict(facecolor='salmon')
+                ],
+                flierprops=dict(marker='o', markerfacecolor='red', markersize=3))
+    plt.ylabel('Error (km)')
+    plt.title('Depth Error')
+    plt.grid(True, linestyle='--', alpha=0.5)
+    
+# 3D error comparison
+    plt.subplot(1, 3, 3)
+    plt.boxplot([err_3d_enhanced, err_3d_basic, err_3d_without], 
+                labels=['Enhanced Waveform', 'Basic Waveform', 'No Waveform'],
+                patch_artist=True,
+                boxprops=[
+                    dict(facecolor='lightgreen'),
+                    dict(facecolor='lightblue'),
+                    dict(facecolor='salmon')
+                ],
+                flierprops=dict(marker='o', markerfacecolor='red', markersize=3))
+    plt.ylabel('Error (km)')
+    plt.title('3D Error')
+    plt.grid(True, linestyle='--', alpha=0.5)
+    
+    plt.suptitle(f'Error Distribution Comparison: Enhanced vs Basic vs No Waveform Features ({model_type.upper()})', fontsize=16)
+    plt.tight_layout()
+    plt.savefig(f"results/waveform_comparison/error_distributions_{model_type}.png", dpi=300, bbox_inches="tight")
+    
+    # 3. Compare success rates at different thresholds
+    plt.figure(figsize=(18, 6))
+    
+    thresholds = [5, 10, 15, 20, 50]
+    
+    # Horizontal success rates
+    plt.subplot(1, 3, 1)
+    horiz_success_enhanced = [metrics_enhanced.get(f"horizontal_{t}km", 0) for t in thresholds]
+    horiz_success_basic = [metrics_basic.get(f"horizontal_{t}km", 0) for t in thresholds]
+    horiz_success_without = [metrics_without.get(f"horizontal_{t}km", 0) for t in thresholds]
+    
+    plt.plot(thresholds, horiz_success_enhanced, 'o-', color='green', label='Enhanced Waveform', linewidth=2)
+    plt.plot(thresholds, horiz_success_basic, 's-', color='blue', label='Basic Waveform', linewidth=2)
+    plt.plot(thresholds, horiz_success_without, '^--', color='red', label='No Waveform', linewidth=2)
+    plt.xlabel('Distance Threshold (km)')
+    plt.ylabel('Success Rate (%)')
+    plt.title('Horizontal Location Success')
+    plt.grid(True)
+    plt.legend()
+    
+    # Depth success rates
+    plt.subplot(1, 3, 2)
+    depth_success_enhanced = [metrics_enhanced.get(f"depth_{t}km", 0) for t in thresholds]
+    depth_success_basic = [metrics_basic.get(f"depth_{t}km", 0) for t in thresholds]
+    depth_success_without = [metrics_without.get(f"depth_{t}km", 0) for t in thresholds]
+    
+    plt.plot(thresholds, depth_success_enhanced, 'o-', color='green', label='Enhanced Waveform', linewidth=2)
+    plt.plot(thresholds, depth_success_basic, 's-', color='blue', label='Basic Waveform', linewidth=2)
+    plt.plot(thresholds, depth_success_without, '^--', color='red', label='No Waveform', linewidth=2)
+    plt.xlabel('Distance Threshold (km)')
+    plt.ylabel('Success Rate (%)')
+    plt.title('Depth Location Success')
+    plt.grid(True)
+    plt.legend()
+    
+    # 3D success rates
+    plt.subplot(1, 3, 3)
+    success_3d_enhanced = [metrics_enhanced.get(f"3d_{t}km", 0) for t in thresholds]
+    success_3d_basic = [metrics_basic.get(f"3d_{t}km", 0) for t in thresholds]
+    success_3d_without = [metrics_without.get(f"3d_{t}km", 0) for t in thresholds]
+    
+    plt.plot(thresholds, success_3d_enhanced, 'o-', color='green', label='Enhanced Waveform', linewidth=2)
+    plt.plot(thresholds, success_3d_basic, 's-', color='blue', label='Basic Waveform', linewidth=2)
+    plt.plot(thresholds, success_3d_without, '^--', color='red', label='No Waveform', linewidth=2)
+    plt.xlabel('Distance Threshold (km)')
+    plt.ylabel('Success Rate (%)')
+    plt.title('3D Location Success')
+    plt.grid(True)
+    plt.legend()
+    
+    plt.suptitle(f'Success Rate Comparison: Enhanced vs Basic vs No Waveform Features ({model_type.upper()})', fontsize=16)
+    plt.tight_layout()
+    plt.savefig(f"results/waveform_comparison/success_rates_{model_type}.png", dpi=300, bbox_inches="tight")
+    
+    # Create a summary table as a figure
+    plt.figure(figsize=(14, 8))
+    plt.axis('tight')
+    plt.axis('off')
+    
+    # Prepare data for the table
+    metric_names = [
+        "Mean Horizontal Error (km)",
+        "Median Horizontal Error (km)",
+        "Mean Depth Error (km)",
+        "Median Depth Error (km)",
+        "Mean 3D Error (km)",
+        "Median 3D Error (km)",
+        "Success Rate @ 10km (Horiz) %",
+        "Success Rate @ 10km (Depth) %",
+        "Success Rate @ 10km (3D) %"
+    ]
+    
+    # Get values
+    enhanced_vals = [
+        metrics_enhanced.get('abs_mean_horizontal_error', metrics_enhanced.get('mean_horizontal_error')),
+        metrics_enhanced.get('abs_median_horizontal_error', metrics_enhanced.get('median_horizontal_error')),
+        metrics_enhanced.get('abs_mean_depth_error', metrics_enhanced.get('mean_depth_error')),
+        metrics_enhanced.get('abs_median_depth_error', metrics_enhanced.get('median_depth_error')),
+        metrics_enhanced.get('abs_mean_3d_error', metrics_enhanced.get('mean_3d_error')),
+        metrics_enhanced.get('abs_median_3d_error', metrics_enhanced.get('median_3d_error')),
+        metrics_enhanced.get('horizontal_10km', 0),
+        metrics_enhanced.get('depth_10km', 0),
+        metrics_enhanced.get('3d_10km', 0)
+    ]
+    
+    basic_vals = [
+        metrics_basic.get('abs_mean_horizontal_error', metrics_basic.get('mean_horizontal_error')),
+        metrics_basic.get('abs_median_horizontal_error', metrics_basic.get('median_horizontal_error')),
+        metrics_basic.get('abs_mean_depth_error', metrics_basic.get('mean_depth_error')),
+        metrics_basic.get('abs_median_depth_error', metrics_basic.get('median_depth_error')),
+        metrics_basic.get('abs_mean_3d_error', metrics_basic.get('mean_3d_error')),
+        metrics_basic.get('abs_median_3d_error', metrics_basic.get('median_3d_error')),
+        metrics_basic.get('horizontal_10km', 0),
+        metrics_basic.get('depth_10km', 0),
+        metrics_basic.get('3d_10km', 0)
+    ]
+    
+    without_vals = [
+        metrics_without.get('abs_mean_horizontal_error', metrics_without.get('mean_horizontal_error')),
+        metrics_without.get('abs_median_horizontal_error', metrics_without.get('median_horizontal_error')),
+        metrics_without.get('abs_mean_depth_error', metrics_without.get('mean_depth_error')),
+        metrics_without.get('abs_median_depth_error', metrics_without.get('median_depth_error')),
+        metrics_without.get('abs_mean_3d_error', metrics_without.get('mean_3d_error')),
+        metrics_without.get('abs_median_3d_error', metrics_without.get('median_3d_error')),
+        metrics_without.get('horizontal_10km', 0),
+        metrics_without.get('depth_10km', 0),
+        metrics_without.get('3d_10km', 0)
+    ]
+    
+    # Calculate improvement of enhanced over basic
+    enhanced_vs_basic_imp = []
+    for e, b in zip(enhanced_vals, basic_vals):
+        if b > 0:  # Avoid division by zero
+            if metric_names[len(enhanced_vs_basic_imp)].startswith("Success"):
+                # For success metrics, higher is better
+                imp = (e - b) / b * 100
+            else:
+                # For error metrics, lower is better
+                imp = (b - e) / b * 100
+            enhanced_vs_basic_imp.append(f"{imp:.1f}%")
+        else:
+            enhanced_vs_basic_imp.append("N/A")
+    
+    # Calculate improvement of enhanced over no waveform
+    enhanced_vs_none_imp = []
+    for e, n in zip(enhanced_vals, without_vals):
+        if n > 0:  # Avoid division by zero
+            if metric_names[len(enhanced_vs_none_imp)].startswith("Success"):
+                # For success metrics, higher is better
+                imp = (e - n) / n * 100
+            else:
+                # For error metrics, lower is better
+                imp = (n - e) / n * 100
+            enhanced_vs_none_imp.append(f"{imp:.1f}%")
+        else:
+            enhanced_vs_none_imp.append("N/A")
+    
+    # Format values
+    enhanced_vals_formatted = [f"{v:.2f}" for v in enhanced_vals]
+    basic_vals_formatted = [f"{v:.2f}" for v in basic_vals]
+    without_vals_formatted = [f"{v:.2f}" for v in without_vals]
+    
+    # Create the table
+    table_data = [
+        ['Metric', 'Enhanced Waveform', 'Basic Waveform', 'No Waveform', 'Enh vs Basic', 'Enh vs None']
+    ]
+    
+    for i in range(len(metric_names)):
+        table_data.append([
+            metric_names[i], 
+            enhanced_vals_formatted[i], 
+            basic_vals_formatted[i],
+            without_vals_formatted[i],
+            enhanced_vs_basic_imp[i],
+            enhanced_vs_none_imp[i]
+        ])
+    
+    table = plt.table(cellText=table_data, loc='center', cellLoc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 1.5)
+    
+    # Color the cells based on improvement
+    for i in range(1, len(metric_names) + 1):
+        # Enhanced vs Basic improvement
+        imp_text = enhanced_vs_basic_imp[i-1]
+        if imp_text != "N/A":
+            imp_val = float(imp_text.strip('%'))
+            if imp_val > 0:
+                # Positive improvement - green
+                table[(i, 4)].set_facecolor('#d8f3dc')
+            elif imp_val < 0:
+                # Negative improvement - light red
+                table[(i, 4)].set_facecolor('#ffcccb')
+        
+        # Enhanced vs None improvement
+        imp_text = enhanced_vs_none_imp[i-1]
+        if imp_text != "N/A":
+            imp_val = float(imp_text.strip('%'))
+            if imp_val > 0:
+                # Positive improvement - green
+                table[(i, 5)].set_facecolor('#d8f3dc')
+            elif imp_val < 0:
+                # Negative improvement - light red
+                table[(i, 5)].set_facecolor('#ffcccb')
+    
+    # Set header colors
+    for j in range(6):
+        table[(0, j)].set_facecolor('#4a5759')
+        table[(0, j)].set_text_props(color='white')
+    
+    plt.title(f'Waveform Features Impact Summary ({model_type.upper()})', fontsize=16)
+    plt.tight_layout()
+    plt.savefig(f"results/waveform_comparison/summary_table_{model_type}.png", dpi=300, bbox_inches="tight")
+    
+    print("Created comparison visualizations in results/waveform_comparison directory")
+
+
+def main(data_path="aftershock_data.pkl", model_type="gat", num_epochs=50, patience=10, experiment=None):
+    """
+    Main function to run aftershock location prediction using causal GNN approach.
+    
+    Args:
+        data_path: Path to the pickle file with aftershock data
+        model_type: Type of GNN to use (default: "gat")
+        num_epochs: Maximum number of training epochs
+        patience: Early stopping patience
+        experiment: Specific experiment to run (None, "waveform", "enhanced_waveform")
+    """
+    print("===== Aftershock Location Prediction with Causal GNN =====")
+    
+    # Create output directories
+    os.makedirs("results", exist_ok=True)
+    
+    # Load the data
+    if not os.path.exists(data_path):
+        print(f"Error: {data_path} not found")
+        return
+    
+    # Load the data
+    print(f"Loading data from {data_path}...")
+    df = read_data_from_pickle(data_path)
+    
+    # Sort data chronologically but DO NOT shuffle
+    df_sorted = df.copy()
+    df_sorted["timestamp"] = pd.to_datetime(df["source_origin_time"])
+    df_sorted = df_sorted.sort_values("timestamp").drop("timestamp", axis=1)
+    
+    # Just use the sorted dataframe as is - no shuffling!
+    df = df_sorted[2:].reset_index(drop=True)
+
+    print(f"Loaded data with {len(df)} events")
+    
+    # Run specific experiment if requested
+    if experiment == "waveform":
+        print("\n===== Running Basic Waveform Feature Comparison Experiment =====")
+        results = run_waveform_comparison_experiment(
+            df, 
+            model_type=model_type, 
+            num_epochs=num_epochs, 
+            patience=patience
+        )
+        return results
+    
+    elif experiment == "enhanced_waveform":
+        print("\n===== Training Model with Enhanced Waveform Features =====")
+        
+        # Create relative coordinate graphs using the causal approach with enhanced waveform features
+        graph_data_list, reference_coords = create_causal_spatiotemporal_graph_configurable(
+            df,
+            time_window=120,  # 120 hours
+            spatial_threshold=75,  # 75 km
+            min_connections=5,
+            use_waveform_features=True,
+            enhanced_waveform=True,
+            sampling_rate=100
+        )
+        
+        print(f"Created {len(graph_data_list)} causal graphs with enhanced waveform features")
+        
+        # Train a model with enhanced waveform features
+        predictor = RelativeGNNAftershockPredictor(
+            graph_data_list=graph_data_list,
+            reference_coords=reference_coords,
+            gnn_type=model_type,
+            hidden_dim=128,
+            num_layers=3,
+            learning_rate=0.0026154033981211277,
+            batch_size=8,
+            weight_decay=6.4617557814088705e-06
+        )
+        
+        # Debug the data structure to verify no leakage
+        predictor.debug_data_structure()
+        
+        # Train the model
+        predictor.train(num_epochs=num_epochs, patience=patience)
+        
+        # Test the model
+        print(f"Testing enhanced waveform {model_type.upper()} model...")
+        metrics, y_true, y_pred, errors = predictor.test()
+        
+        # Print metrics
+        print(f"\nEnhanced Waveform {model_type.upper()} Prediction Metrics:")
+        for key, value in metrics.items():
+            print(f"{key}: {value:.4f}")
+        
+        # Plot results
+        plot_relative_results(
+            y_true, y_pred, errors,
+            reference_coords=reference_coords,
+            model_name=f"Enhanced_{model_type}"
+        )
+        
+        # Plot 3D results
+        plot_3d_aftershocks(
+            y_true, y_pred,
+            reference_coords=reference_coords,
+            model_name=f"Enhanced_{model_type}"
+        )
+        
+        # Save results
+        results = {
+            f"enhanced_{model_type}": {
+                "metrics": metrics,
+                "y_true": y_true,
+                "y_pred": y_pred, 
+                "errors": errors
+            }
+        }
+        
+        with open("enhanced_waveform_results.pkl", "wb") as f:
+            pickle.dump(results, f)
+        
+        return results
+    
+    # Default: run standard model training with basic waveform features
+    print("\n===== Training Standard Model with Basic Waveform Features =====")
+    
+    # Create relative coordinate graphs using the causal approach
+    graph_data_list, reference_coords = create_causal_spatiotemporal_graph_configurable(
+        df,
+        time_window=120,  # 120 hours
+        spatial_threshold=75,  # 75 km
+        min_connections=5,
+        use_waveform_features=True,  # Using basic waveform features by default
+        enhanced_waveform=False
+    )
+    
+    print(f"Created {len(graph_data_list)} causal graphs in relative coordinate system")
+    print(f"Reference coordinates: {reference_coords}")
+    
+    # Train a model with our fixed causal approach
+    predictor = RelativeGNNAftershockPredictor(
+        graph_data_list=graph_data_list,
+        reference_coords=reference_coords,
+        gnn_type=model_type,
+        hidden_dim=128,
+        num_layers=3,
+        learning_rate=0.0026154033981211277,
+        batch_size=8,
+        weight_decay=6.4617557814088705e-06
+    )
+    
+    # Debug the data structure to verify no leakage
+    predictor.debug_data_structure()
+    
+    # Train the model
+    predictor.train(num_epochs=num_epochs, patience=patience)
+    
+    # Test the model
+    print(f"Testing causal {model_type.upper()} model...")
+    metrics, y_true, y_pred, errors = predictor.test()
+    
+    # Print metrics
+    print(f"\nCausal {model_type.upper()} Relative Prediction Metrics:")
+    for key, value in metrics.items():
+        print(f"{key}: {value:.4f}")
+    
+    # Plot regular results
+    plot_relative_results(
+        y_true, y_pred, errors,
+        reference_coords=reference_coords,
+        model_name=f"Causal_{model_type}"
+    )
+    
+    # Plot 3D results
+    plot_3d_aftershocks(
+        y_true, y_pred,
+        reference_coords=reference_coords,
+        model_name=f"Causal_{model_type}"
+    )
+    
+    # Save results for potential comparison
+    results = {
+        model_type: {
+            "metrics": metrics,
+            "y_true": y_true,
+            "y_pred": y_pred, 
+            "errors": errors
+        }
+    }
+    
+    with open("rel_results.pkl", "wb") as f:
+        pickle.dump(results, f)
+    
+    print("Model training and evaluation complete. Results saved to results directory")
+    
+    return results
+
+
+if __name__ == "__main__":
+    # Set up command-line argument parsing
+    parser = argparse.ArgumentParser(description="Aftershock Location Prediction with Causal GNN")
+    
+    # Data and model parameters
+    parser.add_argument('--data', type=str, default="aftershock_data.pkl",
+                        help='Path to aftershock data pickle file')
+    parser.add_argument('--model', type=str, default="gat",
+                        choices=['gat', 'gcn', 'sage', 'graph'],
+                        help='GNN model type to use')
+    parser.add_argument('--epochs', type=int, default=50,
+                        help='Maximum number of training epochs')
+    parser.add_argument('--patience', type=int, default=10,
+                        help='Early stopping patience')
+    parser.add_argument('--batch-size', type=int, default=8,
+                        help='Training batch size')
+    parser.add_argument('--hidden-dim', type=int, default=128,
+                        help='Hidden layer dimension')
+    parser.add_argument('--num-layers', type=int, default=3,
+                        help='Number of GNN layers')
+    
+    # Graph construction parameters
+    parser.add_argument('--time-window', type=float, default=120,
+                        help='Time window in hours for graph construction')
+    parser.add_argument('--spatial-threshold', type=float, default=75, 
+                        help='Spatial threshold in km for graph construction')
+    parser.add_argument('--min-connections', type=int, default=5,
+                        help='Minimum connections required for graph nodes')
+    
+    # Experiment selection
+    parser.add_argument('--experiment', type=str, default=None,
+                        choices=[None, 'waveform', 'enhanced_waveform'],
+                        help='Run specific experiment ("waveform" or "enhanced_waveform")')
+    
+    # Waveform feature parameters
+    parser.add_argument('--use-waveform', type=bool, default=True,
+                        help='Whether to use waveform features')
+    parser.add_argument('--enhanced-waveform', type=bool, default=False,
+                        help='Whether to use enhanced waveform features')
+    parser.add_argument('--sampling-rate', type=int, default=100,
+                        help='Sampling rate for waveform data in Hz')
+    
+    # Parse arguments
+    args = parser.parse_args()
+    
+    # Call main function with parsed arguments
+    main(
+        data_path=args.data,
+        model_type=args.model,
+        num_epochs=args.epochs,
+        patience=args.patience,
+        experiment=args.experiment
+    )

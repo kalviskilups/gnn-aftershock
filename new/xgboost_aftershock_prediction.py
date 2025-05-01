@@ -1,0 +1,2346 @@
+#!/usr/bin/env python3
+# xgboost_aftershock_prediction.py - XGBoost-based models for aftershock location prediction
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, GroupKFold, RandomizedSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.feature_selection import VarianceThreshold
+from xgboost import XGBRegressor
+from sklearn.multioutput import MultiOutputRegressor
+import pickle
+from scipy import signal
+import os
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import seisbench.data as sbd
+from tqdm import tqdm
+import warnings
+import time
+import argparse
+
+
+class XGBoostAfterShockPredictor:
+    """
+    Class for predicting aftershock locations using XGBoost models
+    with best-station and multi-station approaches
+    """
+
+    def __init__(
+        self, data_file=None, validation_level="full", approach="best_station"
+    ):
+        """
+        Initialize the predictor
+        
+        Args:
+            data_file: Path to pickle or HDF5 file with preprocessed data
+            validation_level: Level of validation to apply
+                            "full" - all checks
+                            "critical" - only critical checks
+                            "none" - no validation
+            approach: Analysis approach to use
+                    "best_station" - use only the best station for each event
+                    "multi_station" - use all available stations for each event
+        """
+        self.data_dict = None
+        self.aftershocks_df = None
+        self.mainshock_key = None
+        self.mainshock = None
+        self.models = None
+        self.feature_importances = None
+        self.scaler = None
+        self.validation_level = validation_level
+        self.validation_results = {}
+        self.approach = approach
+        self.data_format = None  # Will be set when loading data
+
+        print(f"Validation level: {validation_level}")
+        print(f"Analysis approach: {approach}")
+
+        # Load data
+        if data_file and os.path.exists(data_file):
+            print(f"Loading data from {data_file}")
+            # Determine file type by extension
+            if data_file.lower().endswith('.pkl') or data_file.lower().endswith('.pickle'):
+                self.data_dict = self.load_from_pickle(data_file)
+            elif data_file.lower().endswith('.h5') or data_file.lower().endswith('.hdf5'):
+                self.data_dict = self.load_from_hdf5(data_file)
+            else:
+                raise ValueError(f"Unsupported file type: {data_file}. Must be .pkl, .pickle, .h5, or .hdf5")
+        else:
+            print("No file found or invalid path provided.")
+            return
+
+        # Standardize waveform lengths BEFORE data integrity validation
+        self.standardize_waveforms(target_length=14636)
+
+        # Check data integrity after standardization
+        if validation_level != "none":
+            self.validate_data_integrity()
+
+    def load_from_pickle(self, pickle_path):
+        """
+        Load data from a pickle file with support for multi-station format
+        """
+        with open(pickle_path, "rb") as f:
+            data_dict = pickle.load(f)
+
+        # Check if this is the new multi-station format
+        is_multi_station = False
+        if data_dict:
+            # Get the first event key and check its value
+            first_event_key = next(iter(data_dict))
+            first_event_data = data_dict[first_event_key]
+            # If the value is a dict of station keys, it's the multi-station format
+            is_multi_station = isinstance(first_event_data, dict) and any(
+                isinstance(k, str) and "." in k for k in first_event_data.keys()
+            )
+
+        if is_multi_station:
+            print("Detected multi-station data format")
+            self.data_format = "multi_station"
+        else:
+            print("Detected single-station data format")
+            self.data_format = "single_station"
+
+        return data_dict
+
+
+    def load_from_hdf5(self, hdf5_path):
+        """
+        Load data from an HDF5 file with support for multi-station format
+        
+        Args:
+            hdf5_path: Path to the HDF5 file
+            
+        Returns:
+            Dictionary with event data in the expected format
+        """
+        import h5py
+        import numpy as np
+        
+        print(f"Loading data from HDF5 file: {hdf5_path}")
+        
+        data_dict = {}
+        
+        with h5py.File(hdf5_path, "r") as h5f:
+            # Check metadata
+            if 'metadata' in h5f:
+                total_events = h5f['metadata'].attrs.get('total_events', 0)
+                total_stations = h5f['metadata'].attrs.get('total_stations', 0)
+                print(f"HDF5 file contains {total_events} events and {total_stations} total station recordings")
+            
+            # Check if 'events' group exists
+            if 'events' not in h5f:
+                raise ValueError(f"Invalid HDF5 file structure: 'events' group not found in {hdf5_path}")
+            
+            # Get all event keys
+            events_group = h5f['events']
+            
+            # Determine data format by checking the structure
+            is_multi_station = False
+            for event_key in events_group:
+                event_group = events_group[event_key]
+                if 'stations' in event_group:
+                    is_multi_station = True
+                    break
+            
+            if is_multi_station:
+                print("Detected multi-station data format in HDF5 file")
+                self.data_format = "multi_station"
+            else:
+                print("Detected single-station data format in HDF5 file")
+                self.data_format = "single_station"
+            
+            # Process all events
+            for event_key in events_group:
+                event_group = events_group[event_key]
+                
+                # Get event metadata
+                if 'event_metadata' in event_group:
+                    origin_time = event_group['event_metadata'].attrs['source_origin_time']
+                    lat = float(event_group['event_metadata'].attrs['source_latitude_deg'])
+                    lon = float(event_group['event_metadata'].attrs['source_longitude_deg'])
+                    depth = float(event_group['event_metadata'].attrs['source_depth_km'])
+                    
+                    # Create event tuple key
+                    event_tuple = (origin_time, lat, lon, depth)
+                    
+                    if is_multi_station:
+                        # Process multi-station format
+                        if 'stations' in event_group:
+                            stations_group = event_group['stations']
+                            stations_data = {}
+                            
+                            for station_key in stations_group:
+                                station_group = stations_group[station_key]
+                                
+                                # Replace underscore with dot for station key (h5 doesn't like dots in group names)
+                                real_station_key = station_key.replace("_", ".")
+                                
+                                # Get waveform data
+                                waveform = station_group['waveform'][:]
+                                
+                                # Get metadata
+                                metadata = {}
+                                if 'metadata' in station_group:
+                                    for key, value in station_group['metadata'].attrs.items():
+                                        # Convert special values if needed
+                                        if value == "NA":
+                                            metadata[key] = None
+                                        else:
+                                            metadata[key] = value
+                                
+                                # Get station distance and score
+                                station_distance = float(station_group.attrs.get('station_distance', 0))
+                                selection_score = float(station_group.attrs.get('selection_score', 0))
+                                
+                                # Create station entry
+                                stations_data[real_station_key] = {
+                                    'metadata': metadata,
+                                    'waveform': waveform,
+                                    'station_distance': station_distance,
+                                    'selection_score': selection_score
+                                }
+                            
+                            # Add to data dictionary
+                            data_dict[event_tuple] = stations_data
+                    else:
+                        # Process single-station format
+                        if 'waveform' in event_group:
+                            waveform = event_group['waveform'][:]
+                            
+                            # Get metadata
+                            metadata = {}
+                            if 'metadata' in event_group:
+                                for key, value in event_group['metadata'].attrs.items():
+                                    if value == "NA":
+                                        metadata[key] = None
+                                    else:
+                                        metadata[key] = value
+                            
+                            # Create event entry
+                            data_dict[event_tuple] = {
+                                'metadata': metadata,
+                                'waveform': waveform
+                            }
+            
+            print(f"Successfully loaded {len(data_dict)} events from HDF5 file")
+            
+            # Check for multi-station data
+            if is_multi_station:
+                total_stations = sum(len(stations) for stations in data_dict.values())
+                print(f"Total station recordings: {total_stations}")
+        
+        return data_dict
+
+    def standardize_waveforms(self, target_length=14636):
+        """
+        Standardize all waveforms to the same length by padding or trimming
+
+        Args:
+            target_length: Target length for all waveforms (samples)
+        """
+        print("\n" + "=" * 50)
+        print(f"STANDARDIZING WAVEFORMS TO {target_length} SAMPLES")
+        print("=" * 50)
+
+        modified_count = 0
+
+        if self.data_format == "multi_station":
+            # For multi-station format, loop through the nested structure
+            for event_key, stations_data in self.data_dict.items():
+                for station_key, station_data in stations_data.items():
+                    waveform = station_data["waveform"]
+
+                    # Skip if already the correct length
+                    if waveform.shape[1] == target_length:
+                        continue
+
+                    # Pad or trim the waveform
+                    if waveform.shape[1] > target_length:
+                        # Trim to target length
+                        self.data_dict[event_key][station_key]["waveform"] = waveform[
+                            :, :target_length
+                        ]
+                    else:
+                        # Pad with zeros
+                        padded = np.zeros((3, target_length))
+                        padded[:, : waveform.shape[1]] = waveform
+                        self.data_dict[event_key][station_key]["waveform"] = padded
+
+                    modified_count += 1
+        else:
+            # Original single-station format
+            for event_key, event_data in self.data_dict.items():
+                waveform = event_data["waveform"]
+
+                # Skip if already the correct length
+                if waveform.shape[1] == target_length:
+                    continue
+
+                # Pad or trim the waveform
+                if waveform.shape[1] > target_length:
+                    # Trim to target length
+                    self.data_dict[event_key]["waveform"] = waveform[:, :target_length]
+                else:
+                    # Pad with zeros
+                    padded = np.zeros((3, target_length))
+                    padded[:, : waveform.shape[1]] = waveform
+                    self.data_dict[event_key]["waveform"] = padded
+
+                modified_count += 1
+
+        print(f"Standardized {modified_count} waveforms to length {target_length}")
+        return modified_count
+
+    def find_mainshock(self):
+        """
+        Identify the mainshock in the dataset
+        For the Iquique sequence, the mainshock occurred on April 1, 2014
+        """
+        # Use manual specification of Iquique mainshock (from USGS catalog)
+        mainshock_coords = {
+            "origin_time": "2014-04-01T23:46:50.000000Z",
+            "latitude": -19.642,
+            "longitude": -70.817,
+            "depth": 25.0,
+        }
+
+        print("Using manually specified mainshock coordinates from USGS catalog")
+
+        # Store mainshock info
+        self.mainshock = mainshock_coords
+
+        # Create a placeholder mainshock key (we don't have this exact event in our dataset)
+        self.mainshock_key = (
+            mainshock_coords["origin_time"],
+            mainshock_coords["latitude"],
+            mainshock_coords["longitude"],
+            mainshock_coords["depth"],
+        )
+
+        # Print the mainshock details
+        print(f"Mainshock: {self.mainshock}")
+
+        return self.mainshock_key
+
+    def create_relative_coordinate_dataframe(self):
+        """
+        Create a DataFrame with all events and their coordinates
+        relative to the mainshock, supporting multi-station format
+        """
+        if self.mainshock_key is None:
+            self.find_mainshock()
+
+        # Extract mainshock coordinates
+        mainshock_lat = self.mainshock["latitude"]
+        mainshock_lon = self.mainshock["longitude"]
+        mainshock_depth = self.mainshock["depth"]
+
+        # Create a list to store all aftershock data
+        events = []
+
+        # Process each event differently based on data format
+        if self.data_format == "multi_station":
+            for event_key, stations_data in self.data_dict.items():
+                origin_time, lat, lon, depth = event_key
+
+                # Calculate relative coordinates
+                x, y, z = self.geographic_to_cartesian(
+                    lat, lon, depth, mainshock_lat, mainshock_lon, mainshock_depth
+                )
+
+                # For each station recording of this event
+                for station_key, station_data in stations_data.items():
+                    events.append(
+                        {
+                            "origin_time": origin_time,
+                            "absolute_lat": lat,
+                            "absolute_lon": lon,
+                            "absolute_depth": depth,
+                            "relative_x": x,  # East-West (km)
+                            "relative_y": y,  # North-South (km)
+                            "relative_z": z,  # Depth difference (km)
+                            "waveform": station_data["waveform"],
+                            "station_key": station_key,
+                            "station_distance": station_data["station_distance"],
+                            "selection_score": station_data["selection_score"],
+                            "metadata": station_data["metadata"],
+                            "is_mainshock": (event_key == self.mainshock_key),
+                        }
+                    )
+        else:
+            # Original single-station format
+            for event_key, event_data in self.data_dict.items():
+                origin_time, lat, lon, depth = event_key
+
+                # Calculate relative coordinates
+                x, y, z = self.geographic_to_cartesian(
+                    lat, lon, depth, mainshock_lat, mainshock_lon, mainshock_depth
+                )
+
+                # Add to the list
+                events.append(
+                    {
+                        "origin_time": origin_time,
+                        "absolute_lat": lat,
+                        "absolute_lon": lon,
+                        "absolute_depth": depth,
+                        "relative_x": x,  # East-West (km)
+                        "relative_y": y,  # North-South (km)
+                        "relative_z": z,  # Depth difference (km)
+                        "waveform": event_data["waveform"],
+                        "metadata": event_data["metadata"],
+                        "is_mainshock": (event_key == self.mainshock_key),
+                    }
+                )
+
+        # Convert to DataFrame
+        self.aftershocks_df = pd.DataFrame(events)
+
+        # Add event_date column for group validation
+        self.aftershocks_df["event_date"] = pd.to_datetime(
+            self.aftershocks_df["origin_time"]
+        ).dt.date
+
+        # Add event_id column to group stations from the same event
+        if self.data_format == "multi_station":
+            self.aftershocks_df["event_id"] = self.aftershocks_df.apply(
+                lambda row: f"{row['origin_time']}_{row['absolute_lat']}_{row['absolute_lon']}_{row['absolute_depth']}",
+                axis=1,
+            )
+
+        # Validate coordinate conversion if required
+        if self.validation_level != "none":
+            self.validate_coordinate_conversion()
+
+        return self.aftershocks_df
+
+
+    def remove_specific_features(self, X, features_to_remove=['pol_inc_min']):
+        """
+        Remove specific features from the dataset
+        
+        Args:
+            X: Feature dataframe
+            features_to_remove: List of feature names to remove
+            
+        Returns:
+            DataFrame with features removed
+        """
+        X_filtered = X.copy()
+        
+        # Find all columns that match any of the patterns to remove
+        columns_to_remove = []
+        for pattern in features_to_remove:
+            matching_cols = [col for col in X.columns if pattern in col]
+            columns_to_remove.extend(matching_cols)
+        
+        # Remove the columns if they exist
+        existing_columns = [col for col in columns_to_remove if col in X.columns]
+        if existing_columns:
+            print(f"Removing {len(existing_columns)} features: {existing_columns}")
+            X_filtered = X_filtered.drop(columns=existing_columns)
+        else:
+            print(f"No matching features found for patterns: {features_to_remove}")
+        
+        return X_filtered
+
+    @staticmethod
+    def geographic_to_cartesian(lat, lon, depth, ref_lat, ref_lon, ref_depth):
+        """
+        Convert geographic coordinates to cartesian coordinates
+        with the reference point (mainshock) as the origin
+
+        Returns (x, y, z) where:
+        x: East-West distance (positive = east)
+        y: North-South distance (positive = north)
+        z: Depth difference (positive = deeper than mainshock)
+        """
+        # Constants for Earth
+        earth_radius = 6371.0  # km
+
+        # Convert to radians
+        lat1, lon1 = np.radians(ref_lat), np.radians(ref_lon)
+        lat2, lon2 = np.radians(lat), np.radians(lon)
+
+        # Calculate the differences
+        dlon = lon2 - lon1
+        dlat = lat2 - lat1
+
+        # North-South distance (y)
+        y = earth_radius * dlat
+
+        # East-West distance (x) - Use reference latitude for better accuracy
+        x = earth_radius * dlon * np.cos(lat1)
+
+        # Depth difference (z) - positive means deeper than mainshock
+        z = depth - ref_depth
+
+        return x, y, z
+
+    @staticmethod
+    def cartesian_to_geographic(x, y, z, ref_lat, ref_lon, ref_depth):
+        """
+        Convert cartesian coordinates back to geographic coordinates
+        """
+        # Earth radius in km
+        earth_radius = 6371.0
+
+        # Convert reference point to radians
+        ref_lat_rad = np.radians(ref_lat)
+
+        # Calculate latitude difference in radians
+        dlat = y / earth_radius
+
+        # Calculate longitude difference in radians
+        dlon = x / (earth_radius * np.cos(ref_lat_rad))
+
+        # Convert to absolute latitude and longitude in radians
+        lat_rad = ref_lat_rad + dlat
+        lon_rad = np.radians(ref_lon) + dlon
+
+        # Convert back to degrees
+        lat = np.degrees(lat_rad)
+        lon = np.degrees(lon_rad)
+
+        # Calculate absolute depth
+        depth = ref_depth + z
+
+        return lat, lon, depth
+
+    def extract_waveform_features(self, waveform, metadata=None):
+        """
+        Extract features from the 3-component waveform data including
+        advanced physics-based magnitude and stress features
+        
+        Args:
+            waveform: 3-component seismic waveform array
+            metadata: Optional metadata dictionary for the station
+        """
+        features = {}
+        
+        # Assume sampling rate of 100 Hz (based on your code context)
+        sampling_rate = 100.0
+        g = 9.81  # Gravitational acceleration in m/s^2
+        
+        # Helper function for corner frequency estimation
+        def estimate_corner_frequency(f, Pxx):
+            """Estimate corner frequency from spectrum using displacement spectrum"""
+            # Convert acceleration spectrum to displacement
+            with np.errstate(divide='ignore', invalid='ignore'):
+                disp_spec = Pxx / (2*np.pi*f)**2
+            
+            # Fix division by zero
+            disp_spec[0] = disp_spec[1] if len(disp_spec) > 1 else 0
+            disp_spec = np.nan_to_num(disp_spec, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            # Smooth the spectrum
+            if len(disp_spec) >= 15:  # Ensure enough points for smoothing
+                disp_spec_smooth = signal.savgol_filter(disp_spec, 15, 3)
+            else:
+                disp_spec_smooth = disp_spec
+            
+            # Find where spectrum falls below half max value
+            max_amp = np.max(disp_spec_smooth)
+            if max_amp > 0:
+                half_max = max_amp / 2
+                corner_indices = np.where(disp_spec_smooth < half_max)[0]
+                
+                if len(corner_indices) > 0:
+                    corner_idx = corner_indices[0]
+                    return f[corner_idx]
+            
+            return 0.0
+        
+        # Calculate radiation pattern proxies
+        try:
+            # Covariance matrix of 3-component data
+            cov_mat = np.cov(waveform)
+            
+            # Eigenvalues represent energy on principal axes
+            eigenvalues = np.linalg.eigvals(cov_mat)
+            eigenvalues = np.sort(eigenvalues)[::-1]  # Sort descending
+            
+            # Ratios of eigenvalues can indicate radiation pattern
+            if eigenvalues[0] > 0:
+                features["radiation_e1_e2_ratio"] = eigenvalues[1] / eigenvalues[0]
+                features["radiation_e1_e3_ratio"] = eigenvalues[2] / eigenvalues[0]
+            else:
+                features["radiation_e1_e2_ratio"] = 0
+                features["radiation_e1_e3_ratio"] = 0
+        except Exception:
+            features["radiation_e1_e2_ratio"] = 0
+            features["radiation_e1_e3_ratio"] = 0
+        
+        # Basic shape features (from original code)
+        for i, component in enumerate(["Z", "N", "E"]):
+            # Simple statistics
+            features[f"{component}_mean"] = np.mean(waveform[i])
+            features[f"{component}_std"] = np.std(waveform[i])
+            features[f"{component}_max"] = np.max(waveform[i])
+            features[f"{component}_min"] = np.min(waveform[i])
+            features[f"{component}_range"] = np.ptp(waveform[i])
+            features[f"{component}_energy"] = np.sum(waveform[i] ** 2)
+
+            # RMS
+            features[f"{component}_rms"] = np.sqrt(np.mean(waveform[i] ** 2))
+
+            # Zero crossings
+            features[f"{component}_zero_crossings"] = np.sum(
+                np.diff(np.signbit(waveform[i]))
+            )
+
+            # Spectral features
+            f, Pxx = signal.welch(waveform[i], fs=sampling_rate, nperseg=256)
+            features[f"{component}_peak_freq"] = f[np.argmax(Pxx)]
+            features[f"{component}_spectral_mean"] = np.mean(Pxx)
+            features[f"{component}_spectral_std"] = np.std(Pxx)
+
+            # Frequency bands energy
+            band_ranges = [(0, 5), (5, 10), (10, 20), (20, 40)]
+            for j, (low, high) in enumerate(band_ranges):
+                mask = (f >= low) & (f <= high)
+                features[f"{component}_band_{low}_{high}_energy"] = np.sum(Pxx[mask])
+                
+            # === NEW MAGNITUDE-RELATED FEATURES ===
+            
+            # Peak Ground Motion Values
+            features[f"{component}_PGA"] = np.max(np.abs(waveform[i]))  # Peak Ground Acceleration
+            
+            try:
+                # Velocity (integrate acceleration)
+                velocity = np.cumsum(waveform[i]) / sampling_rate
+                features[f"{component}_PGV"] = np.max(np.abs(velocity))
+                
+                # Displacement (integrate velocity)
+                displacement = np.cumsum(velocity) / sampling_rate
+                features[f"{component}_PGD"] = np.max(np.abs(displacement))
+                
+                # Energy Integration Metrics
+                # Arias Intensity (proportional to energy)
+                features[f"{component}_arias_intensity"] = np.pi/(2*g) * np.trapz(waveform[i]**2) / sampling_rate
+                
+                # Cumulative Absolute Velocity (CAV)
+                features[f"{component}_CAV"] = np.trapz(np.abs(waveform[i])) / sampling_rate
+            except Exception:
+                # Fallback if integration fails
+                features[f"{component}_PGV"] = 0
+                features[f"{component}_PGD"] = 0
+                features[f"{component}_arias_intensity"] = 0
+                features[f"{component}_CAV"] = 0
+            
+            # Spectral Magnitude Proxies
+            try:
+                # Corner frequency (proxy for magnitude)
+                corner_freq = estimate_corner_frequency(f, Pxx)
+                features[f"{component}_corner_freq"] = corner_freq
+                
+                # Low-frequency spectral plateau (related to seismic moment)
+                lf_mask = f < 1.0
+                if np.any(lf_mask):
+                    lf_level = np.mean(Pxx[lf_mask])
+                    features[f"{component}_lf_spectral_level"] = lf_level
+                else:
+                    features[f"{component}_lf_spectral_level"] = 0
+                    
+                # === NEW STRESS-RELATED FEATURES ===
+                
+                # Brune stress drop parameter (simplified)
+                if corner_freq > 0:
+                    features[f"{component}_brune_stress"] = corner_freq**3
+                else:
+                    features[f"{component}_brune_stress"] = 0
+                
+                # High/low frequency spectral ratio (stress indicator)
+                hf_mask = (f > 10) & (f < 20)
+                lf_mask = (f > 0.5) & (f < 2)
+                
+                if np.any(hf_mask) and np.any(lf_mask):
+                    hf = np.mean(Pxx[hf_mask])
+                    lf = np.mean(Pxx[lf_mask])
+                    features[f"{component}_hf_lf_ratio"] = hf/lf if lf > 0 else 0
+                else:
+                    features[f"{component}_hf_lf_ratio"] = 0
+            except Exception:
+                features[f"{component}_corner_freq"] = 0
+                features[f"{component}_lf_spectral_level"] = 0
+                features[f"{component}_brune_stress"] = 0
+                features[f"{component}_hf_lf_ratio"] = 0
+            
+            # P/S energy ratio if P and S arrivals are available
+            try:
+                if (isinstance(metadata, dict) and
+                    'trace_P_arrival_sample' in metadata and 
+                    'trace_S_arrival_sample' in metadata and
+                    pd.notna(metadata['trace_P_arrival_sample']) and 
+                    pd.notna(metadata['trace_S_arrival_sample'])):
+                    
+                    p_idx = int(metadata['trace_P_arrival_sample'])
+                    s_idx = int(metadata['trace_S_arrival_sample'])
+                    
+                    if p_idx < s_idx and p_idx >= 0 and s_idx < waveform.shape[1]:
+                        # Select P and S wave windows
+                        p_window_end = min(p_idx + int(1 * sampling_rate), s_idx)  # 1 sec window or until S arrival
+                        s_window_end = min(s_idx + int(3 * sampling_rate), waveform.shape[1])  # 3 sec window or until end
+                        
+                        p_window = waveform[i, p_idx:p_window_end]
+                        s_window = waveform[i, s_idx:s_window_end]
+                        
+                        # Calculate energy in P and S waves
+                        p_energy = np.sum(p_window**2)
+                        s_energy = np.sum(s_window**2)
+                        
+                        features[f"{component}_p_s_energy_ratio"] = p_energy/s_energy if s_energy > 0 else 0
+                    else:
+                        features[f"{component}_p_s_energy_ratio"] = 0
+                else:
+                    features[f"{component}_p_s_energy_ratio"] = 0
+            except Exception:
+                features[f"{component}_p_s_energy_ratio"] = 0
+                
+            # Source time function complexity
+            try:
+                # Envelope complexity correlates with stress heterogeneity
+                envelope = np.abs(signal.hilbert(waveform[i]))
+                
+                # Count peaks in envelope above threshold
+                threshold = 0.5 * np.max(envelope) if np.max(envelope) > 0 else 0
+                peaks, _ = signal.find_peaks(envelope, height=threshold)
+                features[f"{component}_envelope_peak_count"] = len(peaks)
+                
+                # Envelope duration above half-maximum
+                if np.max(envelope) > 0:
+                    envelope_norm = envelope / np.max(envelope)
+                    duration_samples = np.sum(envelope_norm > 0.5)
+                    features[f"{component}_envelope_duration"] = duration_samples / sampling_rate
+                else:
+                    features[f"{component}_envelope_duration"] = 0
+            except Exception:
+                features[f"{component}_envelope_peak_count"] = 0
+                features[f"{component}_envelope_duration"] = 0
+
+        # Cross-component features
+        features["Z_N_correlation"] = np.corrcoef(waveform[0], waveform[1])[0, 1]
+        features["Z_E_correlation"] = np.corrcoef(waveform[0], waveform[2])[0, 1]
+        features["N_E_correlation"] = np.corrcoef(waveform[1], waveform[2])[0, 1]
+
+        # Add polarization features (critical for baseline comparison)
+        features["pol_az"] = np.degrees(
+            np.arctan2(np.std(waveform[2]), np.std(waveform[1]))
+        )  # Azimuth
+        features["pol_inc"] = np.degrees(
+            np.arctan2(
+                np.sqrt(np.std(waveform[1]) ** 2 + np.std(waveform[2]) ** 2),
+                np.std(waveform[0]),
+            )
+        )  # Incidence
+        features["rect_lin"] = 1 - (
+            np.min([np.std(waveform[0]), np.std(waveform[1]), np.std(waveform[2])])
+            / np.max([np.std(waveform[0]), np.std(waveform[1]), np.std(waveform[2])])
+        )  # Rectilinearity
+
+        # Extract P-S time difference if available
+        if (
+            isinstance(metadata, dict)
+            and "trace_P_arrival_sample" in metadata
+            and "trace_S_arrival_sample" in metadata
+        ):
+            if pd.notna(metadata["trace_P_arrival_sample"]) and pd.notna(
+                metadata["trace_S_arrival_sample"]
+            ):
+                p_sample = metadata["trace_P_arrival_sample"]
+                s_sample = metadata["trace_S_arrival_sample"]
+                if p_sample < s_sample:  # Ensure P arrives before S
+                    # Convert samples to time (assuming 100 Hz sampling rate)
+                    features["p_s_time_diff"] = (s_sample - p_sample) / 100.0  # in seconds
+
+        return features
+
+    def prepare_best_station_dataset(self):
+        """
+        Prepare dataset using only the best station for each event
+        """
+        if self.aftershocks_df is None:
+            self.create_relative_coordinate_dataframe()
+
+        # For multi-station format, select the best station for each event
+        best_stations_df = self.aftershocks_df
+
+        if self.data_format == "multi_station":
+            print("Selecting best station for each event...")
+            # Group by event_id and select the station with highest selection_score
+            best_station_indices = self.aftershocks_df.groupby("event_id")[
+                "selection_score"
+            ].idxmax()
+            best_stations_df = self.aftershocks_df.loc[
+                best_station_indices
+            ].reset_index(drop=True)
+            print(
+                f"Selected {len(best_stations_df)} best stations from {len(self.aftershocks_df)} total recordings"
+            )
+
+        # Drop station_distance columns early to avoid warnings later
+        best_stations_df = best_stations_df.drop(
+            columns=["station_distance"], errors="ignore"
+        )
+
+        print("Extracting features from waveforms...")
+        # Extract features from the selected waveforms
+        features_list = []
+        errors = 0
+        for idx, row in tqdm(best_stations_df.iterrows(), total=len(best_stations_df)):
+            try:
+                # Extract features with metadata
+                metadata = row.get("metadata", {})
+                features = self.extract_waveform_features(
+                    row["waveform"], metadata=metadata
+                )
+
+                features["origin_time"] = row["origin_time"]
+                features["event_date"] = row["event_date"]
+
+                # Add event_id for proper GroupKFold validation
+                if "event_id" in row:
+                    features["event_id"] = row["event_id"]
+
+                # Add station information if available (except coordinates/distances)
+                if "station_key" in row:
+                    features["station_key"] = row["station_key"]
+
+                features_list.append(features)
+            except Exception as e:
+                errors += 1
+                if errors <= 5:  # Limit error printing
+                    print(f"Error processing waveform {idx}: {e}")
+                elif errors == 6:
+                    print("Additional errors occurred but not printed...")
+
+        print(
+            f"Successfully processed {len(features_list)} waveforms with {errors} errors"
+        )
+
+        # Convert to DataFrame
+        features_df = pd.DataFrame(features_list)
+
+        # Match with the original dataframe using origin_time
+        merge_columns = ["origin_time", "event_date"]
+        if (
+            "station_key" in features_df.columns
+            and "station_key" in best_stations_df.columns
+        ):
+            merge_columns.append("station_key")
+
+        merged_df = pd.merge(
+            features_df,
+            best_stations_df.drop(["waveform", "metadata"], axis=1, errors="ignore"),
+            on=merge_columns,
+        )
+
+        # Remove the mainshock from training data
+        merged_df = merged_df[~merged_df["is_mainshock"]]
+
+        # Define features and targets
+        drop_columns = [
+            "origin_time",
+            "absolute_lat",
+            "absolute_lon",
+            "absolute_depth",
+            "relative_x",
+            "relative_y",
+            "relative_z",
+            "is_mainshock",
+            "event_date",
+        ]
+
+        # Add multi-station specific columns to drop list
+        additional_drops = ["station_key", "selection_score"]
+        drop_columns.extend(
+            [col for col in additional_drops if col in merged_df.columns]
+        )
+
+        # Keep event_id for GroupKFold
+        if "event_id" in merged_df.columns:
+            X = merged_df.drop(drop_columns, axis=1, errors="ignore")
+            y = merged_df[["relative_x", "relative_y", "relative_z", "event_id"]]
+        else:
+            X = merged_df.drop(drop_columns, axis=1, errors="ignore")
+            y = merged_df[["relative_x", "relative_y", "relative_z", "event_date"]]
+
+        # Validate feature preparation if required
+        if self.validation_level != "none":
+            X, y = self.validate_features(X, y)
+
+        return X, y
+
+    def prepare_multi_station_dataset(self):
+        """
+        Advanced method to prepare dataset using multiple stations for each event
+        """
+        if self.aftershocks_df is None:
+            self.create_relative_coordinate_dataframe()
+
+        if self.data_format != "multi_station":
+            print("Using single-station format - falling back to best station approach")
+            return self.prepare_best_station_dataset()
+
+        print("Preparing enhanced multi-station dataset...")
+
+        # Step 1: Extract features from all waveforms
+        print("Extracting features from waveforms...")
+        features_list = []
+        errors = 0
+
+        for idx, row in tqdm(
+            self.aftershocks_df.iterrows(), total=len(self.aftershocks_df)
+        ):
+            try:
+                # Extract features with metadata - STATION COORDINATES WILL NOT BE ADDED
+                metadata = row.get("metadata", {})
+                features = self.extract_waveform_features(
+                    row["waveform"], metadata=metadata
+                )
+
+                # Add station metadata that doesn't leak target information
+                features["station_key"] = row.get("station_key", "")
+                features["event_id"] = row.get("event_id", "")
+                features["origin_time"] = row["origin_time"]
+                features["event_date"] = row["event_date"]
+
+                # Add target values (for later aggregation)
+                features["relative_x"] = row["relative_x"]
+                features["relative_y"] = row["relative_y"]
+                features["relative_z"] = row["relative_z"]
+                features["is_mainshock"] = row["is_mainshock"]
+
+                features_list.append(features)
+            except Exception as e:
+                errors += 1
+                if errors <= 5:
+                    print(f"Error processing waveform {idx}: {e}")
+                elif errors == 6:
+                    print("Additional errors occurred but not printed...")
+
+        print(
+            f"Successfully processed {len(features_list)} waveforms with {errors} errors"
+        )
+
+        # Convert to DataFrame
+        all_features_df = pd.DataFrame(features_list)
+
+        # Remove the mainshock recordings
+        all_features_df = all_features_df[~all_features_df["is_mainshock"]]
+
+        # Step 2: Aggregate features across stations for each event
+        print("Aggregating features across stations for each event...")
+
+        # Group by event_id
+        event_groups = all_features_df.groupby("event_id")
+
+        # List of columns that shouldn't be aggregated
+        skip_columns = [
+            "origin_time",
+            "event_date",
+            "relative_x",
+            "relative_y",
+            "relative_z",
+            "is_mainshock",
+            "event_id",
+            "station_key",
+        ]
+
+        # List of columns that should not be aggregated to prevent data leakage
+        leakage_columns = [
+            col
+            for col in all_features_df.columns
+            if "station_distance" in col
+            or "distance_normalized" in col
+            or "selection_score" in col
+            or "epicentral_distance" in col
+            or "station_lat" in col
+            or "station_lon" in col
+            or "station_elev" in col
+        ]
+
+        skip_columns.extend(leakage_columns)
+
+        # List of numeric feature columns to aggregate
+        numeric_columns = [
+            col
+            for col in all_features_df.columns
+            if col not in skip_columns
+            and pd.api.types.is_numeric_dtype(all_features_df[col])
+        ]
+
+        # Create empty dataframe for aggregated features
+        aggregated_features = []
+
+        for event_id, group in event_groups:
+            # Start with event metadata (same for all stations)
+            event_data = {
+                "event_id": event_id,
+                "origin_time": group["origin_time"].iloc[0],
+                "event_date": group["event_date"].iloc[0],
+                "relative_x": group["relative_x"].iloc[0],
+                "relative_y": group["relative_y"].iloc[0],
+                "relative_z": group["relative_z"].iloc[0],
+                "is_mainshock": group["is_mainshock"].iloc[0],
+                "num_stations": len(group),
+            }
+
+            # For each feature, calculate various statistics across stations
+            for feature in numeric_columns:
+                values = group[feature].values
+
+                # Basic statistics
+                event_data[f"{feature}_mean"] = np.mean(values)
+                event_data[f"{feature}_median"] = np.median(values)
+                event_data[f"{feature}_std"] = np.std(values) if len(values) > 1 else 0
+                event_data[f"{feature}_min"] = np.min(values)
+                event_data[f"{feature}_max"] = np.max(values)
+                event_data[f"{feature}_range"] = np.ptp(values)
+
+                # Add robust statistics
+                # IQR (Interquartile Range)
+                if len(values) >= 4:  # Need at least 4 points for meaningful quartiles
+                    q75, q25 = np.percentile(values, [75, 25])
+                    event_data[f"{feature}_iqr"] = q75 - q25
+                else:
+                    event_data[f"{feature}_iqr"] = 0
+
+                # MAD (Median Absolute Deviation)
+                if len(values) >= 2:
+                    median = np.median(values)
+                    event_data[f"{feature}_mad"] = np.median(np.abs(values - median))
+                else:
+                    event_data[f"{feature}_mad"] = 0
+
+            # Add features from stations without using selection_score (to avoid leakage)
+            station_indices = group.index.tolist()
+
+            # Instead of using selection_score to find best station, use a simple approach
+            # For example, take the first station's features
+            if len(station_indices) > 0:
+                first_station = group.iloc[0]
+                for feature in numeric_columns:
+                    event_data[f"best_{feature}"] = first_station[feature]
+
+            # Add second station features if available, again without selection_score
+            if len(station_indices) > 1:
+                # Get second station
+                second_station = group.iloc[1]
+                for feature in numeric_columns:
+                    event_data[f"second_{feature}"] = second_station[feature]
+
+            aggregated_features.append(event_data)
+
+        # Convert to DataFrame
+        merged_df = pd.DataFrame(aggregated_features)
+        print(
+            f"Created aggregated dataset with {len(merged_df)} events and {len(merged_df.columns)} features"
+        )
+
+        # Define features and targets
+        drop_columns = [
+            "origin_time",
+            "relative_x",
+            "relative_y",
+            "relative_z",
+            "is_mainshock",
+            "event_date",
+        ]
+
+        # Keep event_id for GroupKFold
+        X = merged_df.drop(drop_columns, axis=1)
+        y = merged_df[["relative_x", "relative_y", "relative_z", "event_id"]]
+
+        # Validate feature preparation if required
+        if self.validation_level != "none":
+            X, y = self.validate_features(X, y)
+
+        return X, y
+
+    def prepare_dataset(self):
+        """
+        Prepare dataset for machine learning by extracting features from waveforms
+        """
+        if self.approach == "multi_station" and self.data_format == "multi_station":
+            return self.prepare_multi_station_dataset()
+        else:
+            return self.prepare_best_station_dataset()
+
+    def train_xgboost_models(self, X, y):
+        """
+        Train XGBoost models to predict aftershock locations
+        
+        Args:
+            X: Feature DataFrame
+            y: Target DataFrame with coordinates
+            
+        Returns:
+            X_test, y_test: Test data for evaluation
+        """
+        # Split data into training and testing sets using GroupKFold if available
+        if self.validation_level != "none":
+            if "event_id" in y.columns:
+                print(
+                    "Using GroupKFold with event_id as the group to prevent data leakage..."
+                )
+                # Get a single train/test split using GroupKFold
+                gkf = GroupKFold(n_splits=10)
+                groups = y["event_id"]
+                train_idx, test_idx = next(gkf.split(X, y, groups))
+
+                X_train = X.iloc[train_idx]
+                y_train = y.iloc[train_idx]
+                X_test = X.iloc[test_idx]
+                y_test = y.iloc[test_idx]
+
+                # Drop the group columns from X_train and X_test before modeling
+                if "event_id" in X_train.columns:
+                    X_train = X_train.drop("event_id", axis=1)
+                if "event_id" in X_test.columns:
+                    X_test = X_test.drop("event_id", axis=1)
+
+                # Also drop from y for modeling (keep a copy for evaluation)
+                y_train_coord = y_train.drop("event_id", axis=1)
+                y_test_coord = y_test.drop("event_id", axis=1)
+            elif "event_date" in y.columns:
+                print(
+                    "Using GroupKFold with event_date as the group to prevent temporal leakage..."
+                )
+                # Get a single train/test split using GroupKFold
+                gkf = GroupKFold(n_splits=10)
+                groups = y["event_date"]
+                train_idx, test_idx = next(gkf.split(X, y, groups))
+
+                X_train = X.iloc[train_idx]
+                y_train = y.iloc[train_idx]
+                X_test = X.iloc[test_idx]
+                y_test = y.iloc[test_idx]
+
+                # Drop the group columns from X_train and X_test before modeling
+                if "event_date" in X_train.columns:
+                    X_train = X_train.drop("event_date", axis=1)
+                if "event_date" in X_test.columns:
+                    X_test = X_test.drop("event_date", axis=1)
+
+                # Also drop from y for modeling (keep a copy for evaluation)
+                y_train_coord = y_train.drop("event_date", axis=1)
+                y_test_coord = y_test.drop("event_date", axis=1)
+            else:
+                # Standard random split if no grouping columns available
+                X_temp = X.copy()
+                y_temp = y.copy()
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X_temp, y_temp, test_size=0.2, random_state=42
+                )
+                y_train_coord = y_train
+                y_test_coord = y_test
+        else:
+            # Standard random split for non-validation mode
+            group_cols = [col for col in y.columns if col in ["event_id", "event_date"]]
+            X_temp = X.drop(group_cols, axis=1, errors="ignore")
+            y_temp = y.drop(group_cols, axis=1, errors="ignore")
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_temp, y_temp, test_size=0.2, random_state=42
+            )
+            y_train_coord = y_train
+            y_test_coord = y_test
+
+        # Filter numeric columns for model training
+        numeric_columns = [
+            col
+            for col in X_train.columns
+            if pd.api.types.is_numeric_dtype(X_train[col])
+        ]
+        non_numeric_columns = [
+            col for col in X_train.columns if col not in numeric_columns
+        ]
+
+        if non_numeric_columns:
+            print(
+                f"Removing {len(non_numeric_columns)} non-numeric columns from training data: {non_numeric_columns}"
+            )
+            X_train_numeric = X_train[numeric_columns]
+            X_test_numeric = X_test[numeric_columns]
+        else:
+            X_train_numeric = X_train
+            X_test_numeric = X_test
+
+        # Fixed XGBoost parameters (best parameters from previous tuning)
+        xgb_params = {
+            'n_estimators': 321,
+            'learning_rate': 0.04428532496540518,
+            'max_depth': 12,
+            'min_child_weight': 5,
+            'subsample': 0.7600184177542484,
+            'colsample_bytree': 0.9051733564655277,
+            'reg_alpha': 0.00683735048615785,
+            'reg_lambda': 2.556018273438914e-08,
+            'gamma': 4.4393088202742805e-05,
+            'random_state': 42
+        }
+        
+        print(f"Training XGBoost model with parameters: {xgb_params}")
+        
+        # Create and train XGBoost model with fixed parameters
+        base_xgb = XGBRegressor(**xgb_params)
+        
+        # Use MultiOutputRegressor to predict all three coordinates
+        multi_model = MultiOutputRegressor(base_xgb)
+        multi_model.fit(
+            X_train_numeric, y_train_coord[["relative_x", "relative_y", "relative_z"]]
+        )
+
+        # Make predictions on test set
+        y_pred = multi_model.predict(X_test_numeric)
+
+        # Calculate and print errors
+        multi_ml_errors = {}
+        for i, coord in enumerate(["relative_x", "relative_y", "relative_z"]):
+            mse = mean_squared_error(y_test_coord[coord], y_pred[:, i])
+            rmse = np.sqrt(mse)
+            multi_ml_errors[coord] = rmse
+
+        for i, coord in enumerate(["relative_x", "relative_y", "relative_z"]):
+            r2 = r2_score(y_test_coord[coord], y_pred[:, i])
+            print(f"  {coord} R²: {r2:.4f}")
+
+        # Calculate 3D distance error
+        multi_ml_3d_errors = np.sqrt(
+            (y_pred[:, 0] - y_test_coord["relative_x"]) ** 2
+            + (y_pred[:, 1] - y_test_coord["relative_y"]) ** 2
+            + (y_pred[:, 2] - y_test_coord["relative_z"]) ** 2
+        )
+        multi_ml_errors["3d_distance"] = np.mean(multi_ml_3d_errors)
+
+        print("\nModel Performance (RMSE):")
+        for coord in ["relative_x", "relative_y", "relative_z", "3d_distance"]:
+            print(f"  {coord}: {multi_ml_errors[coord]:.2f} km")
+
+        # Store the model
+        self.models = {"multi_output": multi_model, "type": "xgboost"}
+        self.scaler = None  # No scaler used with XGBoost
+
+        # Extract feature importance
+        self.feature_importances = {}
+        for i, coord in enumerate(["relative_x", "relative_y", "relative_z"]):
+            xgb_model = multi_model.estimators_[i]
+
+            # Get feature importance
+            importance_df = pd.DataFrame(
+                {
+                    "feature": X_train_numeric.columns,
+                    "importance": xgb_model.feature_importances_,
+                }
+            ).sort_values("importance", ascending=False)
+
+            self.feature_importances[coord] = importance_df
+
+            print(f"\nTop features for {coord} prediction:")
+            print(importance_df.head(100))
+
+            # Save feature importance plot
+            plt.figure(figsize=(12, 8))
+            top_features = importance_df.head(100)
+            sns.barplot(x="importance", y="feature", data=top_features)
+            plt.title(f"Top 100 Features for {coord} Prediction (XGBoost)")
+            plt.tight_layout()
+            plt.savefig(f"xgboost_feature_importance_{coord}_{self.approach}.png", dpi=300)
+            plt.close()
+
+        return X_test_numeric, y_test_coord
+
+    def predict_location(self, waveform):
+        """
+        Predict the location of an aftershock from its waveform
+        """
+        if self.models is None:
+            raise ValueError("Models not trained yet. Call train_xgboost_models first.")
+
+        # Extract features from the waveform
+        features = self.extract_waveform_features(waveform)
+
+        # Convert to DataFrame with the same columns as training data
+        feature_df = pd.DataFrame([features])
+
+        # Make predictions using the multi-output model
+        predictions_array = self.models["multi_output"].predict(feature_df)[0]
+
+        # Create a dictionary with the predictions
+        predictions = {
+            "relative_x": predictions_array[0],
+            "relative_y": predictions_array[1],
+            "relative_z": predictions_array[2],
+        }
+
+        return predictions
+
+    def visualize_predictions_geographic(self, X_test, y_test):
+        """
+        Visualize prediction results on a geographic map
+        """
+        if self.models is None:
+            raise ValueError("Models not trained yet")
+
+        # Make predictions using the multi-output model
+        y_pred_array = self.models["multi_output"].predict(X_test)
+        y_pred = pd.DataFrame(
+            y_pred_array,
+            columns=["relative_x", "relative_y", "relative_z"],
+            index=y_test.index,
+        )
+
+        # Convert to absolute coordinates
+        true_absolute = pd.DataFrame(index=y_test.index)
+        pred_absolute = pd.DataFrame(index=y_test.index)
+
+        for i in range(len(y_test)):
+            # True coordinates
+            lat, lon, depth = self.cartesian_to_geographic(
+                y_test["relative_x"].iloc[i],
+                y_test["relative_y"].iloc[i],
+                y_test["relative_z"].iloc[i],
+                self.mainshock["latitude"],
+                self.mainshock["longitude"],
+                self.mainshock["depth"],
+            )
+            true_absolute.loc[y_test.index[i], "lat"] = lat
+            true_absolute.loc[y_test.index[i], "lon"] = lon
+            true_absolute.loc[y_test.index[i], "depth"] = depth
+
+            # Predicted coordinates
+            lat, lon, depth = self.cartesian_to_geographic(
+                y_pred["relative_x"].iloc[i],
+                y_pred["relative_y"].iloc[i],
+                y_pred["relative_z"].iloc[i],
+                self.mainshock["latitude"],
+                self.mainshock["longitude"],
+                self.mainshock["depth"],
+            )
+            pred_absolute.loc[y_test.index[i], "lat"] = lat
+            pred_absolute.loc[y_test.index[i], "lon"] = lon
+            pred_absolute.loc[y_test.index[i], "depth"] = depth
+
+        # Create map
+        fig = plt.figure(figsize=(12, 10))
+        ax = plt.axes(projection=ccrs.Mercator())
+
+        # Add map features
+        ax.add_feature(cfeature.COASTLINE)
+        ax.add_feature(cfeature.BORDERS, linestyle=":")
+
+        # Set extent
+        buffer = 0.3
+        min_lon = min(true_absolute["lon"].min(), pred_absolute["lon"].min()) - buffer
+        max_lon = max(true_absolute["lon"].max(), pred_absolute["lon"].max()) + buffer
+        min_lat = min(true_absolute["lat"].min(), pred_absolute["lat"].min()) - buffer
+        max_lat = max(true_absolute["lat"].max(), pred_absolute["lat"].max()) + buffer
+
+        ax.set_extent([min_lon, max_lon, min_lat, max_lat], crs=ccrs.PlateCarree())
+
+        # Plot true locations
+        ax.scatter(
+            true_absolute["lon"],
+            true_absolute["lat"],
+            c="blue",
+            s=30,
+            alpha=0.7,
+            transform=ccrs.PlateCarree(),
+            label="True Locations",
+        )
+
+        # Plot predicted locations
+        ax.scatter(
+            pred_absolute["lon"],
+            pred_absolute["lat"],
+            c="red",
+            s=30,
+            alpha=0.7,
+            marker="x",
+            transform=ccrs.PlateCarree(),
+            label="Predicted Locations",
+        )
+
+        # Connect true and predicted with lines
+        for i in range(len(true_absolute)):
+            ax.plot(
+                [true_absolute["lon"].iloc[i], pred_absolute["lon"].iloc[i]],
+                [true_absolute["lat"].iloc[i], pred_absolute["lat"].iloc[i]],
+                "k-",
+                alpha=0.2,
+                transform=ccrs.PlateCarree(),
+            )
+
+        # Plot mainshock
+        ax.scatter(
+            self.mainshock["longitude"],
+            self.mainshock["latitude"],
+            c="yellow",
+            s=200,
+            marker="*",
+            edgecolor="black",
+            transform=ccrs.PlateCarree(),
+            zorder=5,
+            label="Mainshock",
+        )
+
+        # Add gridlines and legend
+        gl = ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.7, linestyle="--")
+        gl.top_labels = False
+        gl.right_labels = False
+
+        plt.title(
+            f'XGBoost: True vs Predicted Aftershock Locations ({self.approach.replace("_", " ").title()})'
+        )
+        plt.legend(loc="lower left")
+
+        plt.savefig(
+            f"xgboost_prediction_results_geographic_{self.approach}.png",
+            dpi=300,
+            bbox_inches="tight",
+        )
+
+        # Calculate location errors
+        earth_radius = 6371.0  # km
+
+        # Calculate differences in degrees
+        lat_diff_deg = np.abs(true_absolute["lat"] - pred_absolute["lat"])
+        lon_diff_deg = np.abs(true_absolute["lon"] - pred_absolute["lon"])
+
+        # Convert to approximate distances in km
+        lat_diff_km = lat_diff_deg * (np.pi / 180) * earth_radius
+        # Account for longitude convergence
+        avg_lat = (true_absolute["lat"] + pred_absolute["lat"]) / 2
+        lon_diff_km = (
+            lon_diff_deg * (np.pi / 180) * earth_radius * np.cos(np.radians(avg_lat))
+        )
+
+        # Depth difference
+        depth_diff_km = np.abs(true_absolute["depth"] - pred_absolute["depth"])
+
+        # 3D distance
+        distance_3d_km = np.sqrt(lat_diff_km**2 + lon_diff_km**2 + depth_diff_km**2)
+
+        # Print statistics
+        print("Prediction Error Statistics:")
+        print(f"Mean latitude error: {lat_diff_km.mean():.2f} km")
+        print(f"Mean longitude error: {lon_diff_km.mean():.2f} km")
+        print(f"Mean depth error: {depth_diff_km.mean():.2f} km")
+        print(f"Mean 3D error: {distance_3d_km.mean():.2f} km")
+        print(f"Median 3D error: {distance_3d_km.median():.2f} km")
+
+        # Create error histogram
+        plt.figure(figsize=(10, 6))
+        plt.hist(distance_3d_km, bins=20, alpha=0.7)
+        plt.axvline(
+            distance_3d_km.mean(),
+            color="r",
+            linestyle="--",
+            label=f"Mean: {distance_3d_km.mean():.2f} km",
+        )
+        plt.axvline(
+            distance_3d_km.median(),
+            color="g",
+            linestyle="--",
+            label=f"Median: {distance_3d_km.median():.2f} km",
+        )
+        plt.title(
+            f'XGBoost: 3D Location Error Distribution ({self.approach.replace("_", " ").title()})'
+        )
+        plt.xlabel("Error (km)")
+        plt.ylabel("Frequency")
+        plt.legend()
+        plt.savefig(f"xgboost_prediction_error_histogram_{self.approach}.png", dpi=300)
+
+        # Return coordinate errors
+        return (
+            true_absolute,
+            pred_absolute,
+            {
+                "3d": distance_3d_km,
+                "lat": lat_diff_km,
+                "lon": lon_diff_km,
+                "depth": depth_diff_km,
+            },
+        )
+
+    def run_complete_workflow(self):
+        """
+        Run the complete analysis workflow with XGBoost
+        
+        Returns:
+            Dictionary with results
+        """
+        start_time = time.time()
+
+        # Print header
+        print("\n" + "=" * 70)
+        print(
+            f"XGBOOST AFTERSHOCK ANALYSIS WITH {self.approach.upper()} APPROACH".center(
+                70
+            )
+        )
+        print("=" * 70)
+
+        # 1. Find the mainshock
+        self.find_mainshock()
+
+        # 2. Create relative coordinate dataframe
+        self.create_relative_coordinate_dataframe()
+
+        if self.data_format == "multi_station":
+            event_count = (
+                len(set(self.aftershocks_df["event_id"]))
+                if "event_id" in self.aftershocks_df.columns
+                else len(self.aftershocks_df)
+            )
+            print(
+                f"Created dataframe with {event_count} events and {len(self.aftershocks_df)} station recordings"
+            )
+
+            # Show stations per event statistics
+            if "event_id" in self.aftershocks_df.columns:
+                stations_per_event = self.aftershocks_df.groupby("event_id").size()
+                print(f"Stations per event:")
+                print(f"  Mean: {stations_per_event.mean():.2f}")
+                print(f"  Median: {stations_per_event.median()}")
+                print(f"  Min: {stations_per_event.min()}")
+                print(f"  Max: {stations_per_event.max()}")
+        else:
+            print(f"Created dataframe with {len(self.aftershocks_df)} events")
+
+        # 3. Prepare dataset for machine learning
+        X, y = self.prepare_dataset()
+        print(f"Prepared dataset with {len(X)} samples and {X.shape[1]} features")
+
+        # 4. Train XGBoost models
+        X_test, y_test = self.train_xgboost_models(X, y)
+
+        # 5. Visualize predictions on a geographic map
+        true_abs, pred_abs, errors = self.visualize_predictions_geographic(X_test, y_test)
+
+        # Print execution time
+        end_time = time.time()
+        execution_time = end_time - start_time
+        print(
+            f"\nTotal execution time: {execution_time:.1f} seconds ({execution_time/60:.1f} minutes)"
+        )
+
+        return {
+            "models": self.models,
+            "feature_importances": self.feature_importances,
+            "mainshock": self.mainshock,
+            "aftershocks_df": self.aftershocks_df,
+            "test_results": {
+                "true_absolute": true_abs,
+                "pred_absolute": pred_abs,
+                "errors": errors,
+            },
+            "validation_results": self.validation_results,
+        }
+
+    def validate_data_integrity(self):
+        """
+        Run validation checks on the dataset to catch potential issues
+        """
+        print("\n" + "=" * 50)
+        print("VALIDATING DATA INTEGRITY")
+        print("=" * 50)
+
+        issues = []
+
+        # Skip uniqueness check as instructed - no actual duplicates in the dataset
+        print("Skipping event uniqueness check (confirmed no duplicates)")
+
+        # Check waveform shapes and NaNs
+        print("Checking waveform consistency...")
+        expected_shape = None
+        waveform_issues = 0
+
+        # Check 20 waveforms (multi-station or single-station)
+        if self.data_format == "multi_station":
+            waveform_check_count = 0
+            for event_key, stations_data in self.data_dict.items():
+                for station_key, station_data in stations_data.items():
+                    waveform = station_data["waveform"]
+
+                    # Check number of components
+                    if waveform.shape[0] != 3:
+                        issues.append(
+                            f"Event {event_key}, Station {station_key} has {waveform.shape[0]} components instead of 3"
+                        )
+                        waveform_issues += 1
+                        continue
+
+                    # Set expected length from first waveform
+                    if expected_shape is None:
+                        expected_shape = waveform.shape[1]
+
+                    # Check length consistency
+                    if waveform.shape[1] != expected_shape:
+                        issues.append(
+                            f"Event {event_key}, Station {station_key} has length {waveform.shape[1]} instead of {expected_shape}"
+                        )
+                        waveform_issues += 1
+
+                    # Check for NaNs
+                    if np.isnan(waveform).any():
+                        issues.append(
+                            f"Event {event_key}, Station {station_key} contains NaN values"
+                        )
+                        waveform_issues += 1
+
+                    waveform_check_count += 1
+                    if waveform_check_count >= 20:
+                        print(
+                            f"✓ First {waveform_check_count} waveforms checked (skipping rest for speed)"
+                        )
+                        break
+
+                if waveform_check_count >= 20:
+                    break
+        else:
+            # Single-station format
+            for i, (event_key, event_data) in enumerate(self.data_dict.items()):
+                waveform = event_data["waveform"]
+
+                # Check number of components
+                if waveform.shape[0] != 3:
+                    issues.append(
+                        f"Event {event_key} has {waveform.shape[0]} components instead of 3"
+                    )
+                    waveform_issues += 1
+                    continue
+
+                # Set expected length from first waveform
+                if expected_shape is None:
+                    expected_shape = waveform.shape[1]
+
+                # Check length consistency
+                if waveform.shape[1] != expected_shape:
+                    issues.append(
+                        f"Event {event_key} has length {waveform.shape[1]} instead of {expected_shape}"
+                    )
+                    waveform_issues += 1
+
+                # Check for NaNs
+                if np.isnan(waveform).any():
+                    issues.append(f"Event {event_key} contains NaN values")
+                    waveform_issues += 1
+
+                # Only check first 20 events if dataset is large
+                if i >= 20 and len(self.data_dict) > 50:
+                    print(
+                        f"✓ First 20/{len(self.data_dict)} waveforms checked (skipping rest for speed)"
+                    )
+                    break
+
+        if waveform_issues == 0:
+            print(
+                f"✓ All checked waveforms have consistent shape (3, {expected_shape}) with no NaNs"
+            )
+        else:
+            print(f"❌ Found {waveform_issues} waveform issues!")
+
+        # Overall status
+        validated = len(issues) == 0
+
+        if validated:
+            print("✅ All data integrity checks passed!")
+        else:
+            print(
+                f"⚠️ Found {len(issues)} issues. Will attempt to proceed with caution."
+            )
+            if len(issues) <= 5:
+                for i, issue in enumerate(issues[:5]):
+                    print(f"  {i+1}. {issue}")
+            else:
+                for i, issue in enumerate(issues[:5]):
+                    print(f"  {i+1}. {issue}")
+                print(f"  ... and {len(issues) - 5} more issues")
+
+        self.validation_results["data_integrity"] = {
+            "passed": validated,
+            "issues": issues,
+        }
+
+        return validated, issues
+
+    def validate_coordinate_conversion(self, num_points=50):
+        """
+        Test coordinate conversion functions for accuracy by doing a round-trip conversion
+        geo → cart → geo and measuring the error
+        """
+        print("\n" + "=" * 50)
+        print("VALIDATING COORDINATE CONVERSION")
+        print("=" * 50)
+
+        # Generate random geographic coordinates in a reasonable range around Iquique
+        np.random.seed(44)
+        lats = np.random.uniform(-20.5, -19.5, num_points)
+        lons = np.random.uniform(-71.0, -70.0, num_points)
+        depths = np.random.uniform(10, 50, num_points)
+
+        # Reference point (use mainshock if available, otherwise default)
+        if self.mainshock:
+            ref_lat = self.mainshock["latitude"]
+            ref_lon = self.mainshock["longitude"]
+            ref_depth = self.mainshock["depth"]
+        else:
+            ref_lat, ref_lon, ref_depth = -20.0, -70.5, 30.0
+
+        # Arrays to store errors
+        lat_errors = []
+        lon_errors = []
+        depth_errors = []
+        distance_errors = []
+
+        for i in range(num_points):
+            # Original coordinates
+            orig_lat, orig_lon, orig_depth = lats[i], lons[i], depths[i]
+
+            # Convert to Cartesian
+            x, y, z = self.geographic_to_cartesian(
+                orig_lat, orig_lon, orig_depth, ref_lat, ref_lon, ref_depth
+            )
+
+            # Convert back to geographic
+            new_lat, new_lon, new_depth = self.cartesian_to_geographic(
+                x, y, z, ref_lat, ref_lon, ref_depth
+            )
+
+            # Calculate errors
+            lat_error = abs(orig_lat - new_lat)
+            lon_error = abs(orig_lon - new_lon)
+            depth_error = abs(orig_depth - new_depth)
+
+            # Convert lat/lon errors to approximate distances in km
+            earth_radius = 6371.0
+            lat_error_km = lat_error * (np.pi / 180) * earth_radius
+            lon_error_km = (
+                lon_error * (np.pi / 180) * earth_radius * np.cos(np.radians(orig_lat))
+            )
+
+            # Calculate 3D distance error
+            distance_error = np.sqrt(lat_error_km**2 + lon_error_km**2 + depth_error**2)
+
+            lat_errors.append(lat_error_km)
+            lon_errors.append(lon_error_km)
+            depth_errors.append(depth_error)
+            distance_errors.append(distance_error)
+
+        # Get maximum errors
+        max_errors = {
+            "lat_km": max(lat_errors),
+            "lon_km": max(lon_errors),
+            "depth_km": max(depth_errors),
+            "3d_distance_km": max(distance_errors),
+        }
+
+        # Check if errors are below threshold (100 meters = 0.1 km)
+        threshold = 0.1
+        passed = all(error < threshold for error in max_errors.values())
+
+        # Print results
+        print(f"Round-trip conversion test results ({num_points} random points):")
+        print(f"  Max latitude error: {max_errors['lat_km']*1000:.2f} meters")
+        print(f"  Max longitude error: {max_errors['lon_km']*1000:.2f} meters")
+        print(f"  Max depth error: {max_errors['depth_km']*1000:.2f} meters")
+        print(
+            f"  Max 3D distance error: {max_errors['3d_distance_km']*1000:.2f} meters"
+        )
+
+        if passed:
+            print("✅ All conversion errors below threshold (100 meters)")
+        else:
+            print("⚠️ Some conversion errors exceed threshold (100 meters)")
+            print("   This could impact location accuracy - proceed with caution")
+
+        # Visualize errors
+        plt.figure(figsize=(10, 6))
+        plt.hist(np.array(distance_errors) * 1000, bins=20)
+        plt.axvline(
+            np.mean(distance_errors) * 1000,
+            color="r",
+            linestyle="--",
+            label=f"Mean: {np.mean(distance_errors)*1000:.2f} meters",
+        )
+        plt.axvline(
+            threshold * 1000,
+            color="g",
+            linestyle="-",
+            label=f"Threshold: {threshold*1000:.0f} meters",
+        )
+        plt.title("Distribution of 3D Round-Trip Conversion Errors")
+        plt.xlabel("Error (meters)")
+        plt.ylabel("Frequency")
+        plt.legend()
+        plt.savefig("xgboost_coordinate_conversion_errors.png", dpi=300)
+        plt.close()
+
+        self.validation_results["coordinate_conversion"] = {
+            "passed": passed,
+            "max_errors": max_errors,
+            "mean_error": np.mean(distance_errors),
+        }
+
+        return passed, max_errors
+
+    def validate_features(self, X, y):
+        """
+        Validate feature preparation and check for target leakage
+        """
+        print("\n" + "=" * 50)
+        print("VALIDATING FEATURE PREPARATION")
+        print("=" * 50)
+
+        # Check for target leakage
+        print("Checking for target leakage...")
+
+        # List of patterns that indicate potential target leakage
+        forbidden_patterns = [
+            "station_distance",
+            "distance_normalized",
+            "selection_score",
+            "epicentral_distance",
+            "relative_x",
+            "relative_y",
+            "relative_z",
+            "absolute_lat",
+            "absolute_lon",
+            "absolute_depth",
+            "station_lat",
+            "station_lon",
+            "station_elev",
+        ]
+
+        # Find all columns that match any of the forbidden patterns
+        leaked_features = []
+        for pattern in forbidden_patterns:
+            matching_cols = [col for col in X.columns if pattern in col]
+            leaked_features.extend(matching_cols)
+
+        # Remove duplicates
+        leaked_features = list(set(leaked_features))
+
+        clean = len(leaked_features) == 0
+
+        if clean:
+            print("✅ No target leakage detected")
+        else:
+            print(f"❌ Found {len(leaked_features)} leaked features: {leaked_features}")
+            print("   Removing leaked features to prevent data leakage")
+            X = X.drop(leaked_features, axis=1)
+
+        # Check feature variance
+        print("Checking feature variance...")
+
+        # Define protected features that should never be dropped
+        protected_features = ["pol_az", "pol_inc", "rect_lin", "p_s_time_diff"]
+
+        # Pop grouping columns before variance threshold
+        group_columns = {}
+        if "event_id" in X.columns:
+            group_columns["event_id"] = X["event_id"]
+            X = X.drop("event_id", axis=1)
+        if "event_date" in X.columns:
+            group_columns["event_date"] = X["event_date"]
+            X = X.drop("event_date", axis=1)
+
+        # For multi-station approach, add aggregated versions of protected features
+        if self.approach == "multi_station":
+            for base_feature in protected_features:
+                for prefix in ["", "best_", "second_"]:
+                    for suffix in ["_mean", "_median", "_weighted", ""]:
+                        feature = f"{prefix}{base_feature}{suffix}"
+                        if feature in X.columns and feature not in protected_features:
+                            protected_features.append(feature)
+
+        protected_features_present = [f for f in protected_features if f in X.columns]
+
+        # Apply variance threshold to features except protected ones
+        X_unprotected = X.drop(columns=protected_features_present, errors="ignore")
+
+        # Ensure all remaining features are numeric before applying VarianceThreshold
+        numeric_columns = [
+            col
+            for col in X_unprotected.columns
+            if pd.api.types.is_numeric_dtype(X_unprotected[col])
+        ]
+        non_numeric_columns = [
+            col for col in X_unprotected.columns if col not in numeric_columns
+        ]
+
+        if non_numeric_columns:
+            print(
+                f"  Excluding {len(non_numeric_columns)} non-numeric columns from variance check: {non_numeric_columns}"
+            )
+            X_unprotected = X_unprotected[numeric_columns]
+
+        # Apply variance threshold only to numeric columns
+        selector = VarianceThreshold(threshold=1e-5)
+
+        # Fit and transform only unprotected numeric features
+        X_filtered_array = selector.fit_transform(X_unprotected)
+
+        # Get boolean mask of selected features
+        mask = selector.get_support()
+
+        # Get list of selected features
+        selected_features = X_unprotected.columns[mask]
+
+        # Get list of removed features
+        removed_features = X_unprotected.columns[~mask]
+
+        # Create new DataFrame with selected features + protected features
+        X_filtered = pd.DataFrame(
+            X_filtered_array, columns=selected_features, index=X.index
+        )
+
+        # Add back the protected features
+        for feature in protected_features_present:
+            X_filtered[feature] = X[feature]
+
+        # Add back any non-numeric features that were excluded from variance check
+        for feature in non_numeric_columns:
+            if feature in X.columns:
+                X_filtered[feature] = X[feature]
+
+        # Add back grouping columns
+        for col, values in group_columns.items():
+            X_filtered[col] = values
+
+        print(f"Found {len(removed_features)} features with near-zero variance:")
+        if len(removed_features) > 0:
+            for feature in removed_features[:5]:  # Show first 5 only
+                print(f"  - {feature} (variance: {X[feature].var():.8f})")
+            if len(removed_features) > 5:
+                print(f"  - ... and {len(removed_features) - 5} more")
+        else:
+            print("  No low-variance features found")
+
+        if protected_features_present:
+            print(
+                f"Protected {len(protected_features_present)} critical features from variance filtering:"
+            )
+            for feature in protected_features_present[:5]:  # Show first 5 only
+                print(f"  - {feature}")
+            if len(protected_features_present) > 5:
+                print(f"  - ... and {len(protected_features_present) - 5} more")
+
+        self.validation_results["feature_validation"] = {
+            "target_leakage": {"passed": clean, "leaked_features": leaked_features},
+            "variance_check": {
+                "removed_features": list(removed_features),
+                "protected_features": protected_features_present,
+            },
+        }
+
+        return X_filtered, y
+
+
+    def visualize_untrained_predictions(self):
+        """
+        Visualize what predictions would look like with an untrained model
+        using the mainshock location as baseline (no data leakage)
+        """
+        print("\n" + "=" * 50)
+        print("VISUALIZING UNTRAINED MODEL PREDICTIONS")
+        print("=" * 50)
+        
+        # Prepare dataset without training models
+        self.find_mainshock()
+        self.create_relative_coordinate_dataframe()
+        
+        print("Using mainshock location as baseline prediction for all aftershocks")
+        # In relative coordinates, the mainshock is at (0,0,0)
+        mainshock_relative_coords = np.array([0, 0, 0])
+        
+        # Get aftershocks (excluding the mainshock itself)
+        aftershocks = self.aftershocks_df[~self.aftershocks_df["is_mainshock"]].copy()
+        
+        # Convert to absolute coordinates for visualization
+        true_absolute = pd.DataFrame(index=aftershocks.index)
+        pred_absolute = pd.DataFrame(index=aftershocks.index)
+        
+        for i in range(len(aftershocks)):
+            # True coordinates (already in absolute form in the dataframe)
+            true_absolute.loc[aftershocks.index[i], "lat"] = aftershocks["absolute_lat"].iloc[i]
+            true_absolute.loc[aftershocks.index[i], "lon"] = aftershocks["absolute_lon"].iloc[i]
+            true_absolute.loc[aftershocks.index[i], "depth"] = aftershocks["absolute_depth"].iloc[i]
+            
+            # Predicted coordinates (mainshock location for all)
+            pred_absolute.loc[aftershocks.index[i], "lat"] = self.mainshock["latitude"]
+            pred_absolute.loc[aftershocks.index[i], "lon"] = self.mainshock["longitude"]
+            pred_absolute.loc[aftershocks.index[i], "depth"] = self.mainshock["depth"]
+        
+        # Create map visualization
+        fig = plt.figure(figsize=(12, 10))
+        ax = plt.axes(projection=ccrs.Mercator())
+        
+        # Add map features
+        ax.add_feature(cfeature.COASTLINE)
+        ax.add_feature(cfeature.BORDERS, linestyle=":")
+        
+        # Set extent with buffer
+        buffer = 0.3
+        min_lon = min(true_absolute["lon"].min(), pred_absolute["lon"].min()) - buffer
+        max_lon = max(true_absolute["lon"].max(), pred_absolute["lon"].max()) + buffer
+        min_lat = min(true_absolute["lat"].min(), pred_absolute["lat"].min()) - buffer
+        max_lat = max(true_absolute["lat"].max(), pred_absolute["lat"].max()) + buffer
+        
+        ax.set_extent([min_lon, max_lon, min_lat, max_lat], crs=ccrs.PlateCarree())
+        
+        # Plot true locations
+        ax.scatter(
+            true_absolute["lon"],
+            true_absolute["lat"],
+            c="blue",
+            s=30,
+            alpha=0.7,
+            transform=ccrs.PlateCarree(),
+            label="True Aftershock Locations",
+        )
+        
+        # Plot untrained predictions (all at the mainshock location)
+        ax.scatter(
+            pred_absolute["lon"],
+            pred_absolute["lat"],
+            c="red",
+            s=30,
+            alpha=0.7,
+            marker="x",
+            transform=ccrs.PlateCarree(),
+            label="Baseline Prediction (Mainshock)",
+        )
+        
+        # Connect true and predicted with lines
+        for i in range(len(true_absolute)):
+            ax.plot(
+                [true_absolute["lon"].iloc[i], pred_absolute["lon"].iloc[i]],
+                [true_absolute["lat"].iloc[i], pred_absolute["lat"].iloc[i]],
+                "k-",
+                alpha=0.2,
+                transform=ccrs.PlateCarree(),
+            )
+        
+        # Plot mainshock
+        ax.scatter(
+            self.mainshock["longitude"],
+            self.mainshock["latitude"],
+            c="yellow",
+            s=200,
+            marker="*",
+            edgecolor="black",
+            transform=ccrs.PlateCarree(),
+            zorder=5,
+            label="Mainshock",
+        )
+        
+        # Add gridlines and legend
+        gl = ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.7, linestyle="--")
+        gl.top_labels = False
+        gl.right_labels = False
+        
+        plt.title("Untrained Model")
+        plt.legend(loc="lower left")
+        
+        plt.savefig("untrained_model_predictions.png", dpi=300, bbox_inches="tight")
+        plt.close()
+        
+        # Calculate errors
+        earth_radius = 6371.0  # km
+        
+        # Calculate differences in degrees
+        lat_diff_deg = np.abs(true_absolute["lat"] - pred_absolute["lat"])
+        lon_diff_deg = np.abs(true_absolute["lon"] - pred_absolute["lon"])
+        
+        # Convert to approximate distances in km
+        lat_diff_km = lat_diff_deg * (np.pi / 180) * earth_radius
+        avg_lat = (true_absolute["lat"] + pred_absolute["lat"]) / 2
+        lon_diff_km = lon_diff_deg * (np.pi / 180) * earth_radius * np.cos(np.radians(avg_lat))
+        
+        # Depth difference
+        depth_diff_km = np.abs(true_absolute["depth"] - pred_absolute["depth"])
+        
+        # 3D distance
+        distance_3d_km = np.sqrt(lat_diff_km**2 + lon_diff_km**2 + depth_diff_km**2)
+        
+        # Print statistics
+        print("\nMainshock Baseline Error Statistics:")
+        print(f"Mean latitude error: {lat_diff_km.mean():.2f} km")
+        print(f"Mean longitude error: {lon_diff_km.mean():.2f} km")
+        print(f"Mean depth error: {depth_diff_km.mean():.2f} km")
+        print(f"Mean 3D error: {distance_3d_km.mean():.2f} km")
+        print(f"Median 3D error: {distance_3d_km.median():.2f} km")
+        
+        # Create error histogram
+        plt.figure(figsize=(10, 6))
+        plt.hist(distance_3d_km, bins=20, alpha=0.7)
+        plt.axvline(
+            distance_3d_km.mean(),
+            color="r",
+            linestyle="--",
+            label=f"Mean: {distance_3d_km.mean():.2f} km",
+        )
+        plt.axvline(
+            distance_3d_km.median(),
+            color="g",
+            linestyle="--",
+            label=f"Median: {distance_3d_km.median():.2f} km",
+        )
+        plt.title("Mainshock Baseline: 3D Location Error Distribution")
+        plt.xlabel("Error (km)")
+        plt.ylabel("Frequency")
+        plt.legend()
+        plt.savefig("mainshock_baseline_error_histogram.png", dpi=300)
+        plt.close()
+        
+        return {
+            "true_absolute": true_absolute,
+            "pred_absolute": pred_absolute,
+            "errors": {
+                "3d": distance_3d_km,
+                "lat": lat_diff_km,
+                "lon": lon_diff_km,
+                "depth": depth_diff_km,
+            }
+        }
+
+
+def compare_approaches(data_file, validation_level="full", results_dir="xgboost_results"):
+    """
+    Compare best-station and multi-station approaches on the same dataset using XGBoost
+    """
+    # Create results directory if it doesn't exist
+    os.makedirs(results_dir, exist_ok=True)
+
+    print("\n" + "=" * 70)
+    print("COMPARING BEST-STATION AND MULTI-STATION APPROACHES WITH XGBOOST".center(70))
+    print("=" * 70)
+
+    # 1. Run with best-station approach
+    print("\nRunning best-station approach with XGBoost...")
+    predictor_best = XGBoostAfterShockPredictor(
+        data_file=data_file,
+        validation_level=validation_level,
+        approach="best_station",
+    )
+    results_best = predictor_best.run_complete_workflow()
+
+    # 2. Run with multi-station approach
+    print("\nRunning multi-station approach with XGBoost...")
+    predictor_multi = XGBoostAfterShockPredictor(
+        data_file=data_file,
+        validation_level=validation_level,
+        approach="multi_station",
+    )
+    results_multi = predictor_multi.run_complete_workflow()
+
+    # 3. Compare the results
+    print("\n" + "=" * 70)
+    print("XGBOOST APPROACH COMPARISON SUMMARY".center(70))
+    print("=" * 70)
+
+    # Extract error metrics
+    best_errors = {
+        "relative_x": results_best["test_results"]["errors"]["lon"].mean(),
+        "relative_y": results_best["test_results"]["errors"]["lat"].mean(),
+        "relative_z": results_best["test_results"]["errors"]["depth"].mean(),
+        "3d_distance": results_best["test_results"]["errors"]["3d"].mean(),
+        "3d_median": np.median(results_best["test_results"]["errors"]["3d"]),
+    }
+
+    multi_errors = {
+        "relative_x": results_multi["test_results"]["errors"]["lon"].mean(),
+        "relative_y": results_multi["test_results"]["errors"]["lat"].mean(),
+        "relative_z": results_multi["test_results"]["errors"]["depth"].mean(),
+        "3d_distance": results_multi["test_results"]["errors"]["3d"].mean(),
+        "3d_median": np.median(results_multi["test_results"]["errors"]["3d"]),
+    }
+
+    # Create comparison DataFrame
+    comparison = pd.DataFrame(
+        {
+            "Best-Station": [
+                best_errors[k]
+                for k in [
+                    "relative_x",
+                    "relative_y",
+                    "relative_z",
+                    "3d_distance",
+                    "3d_median",
+                ]
+            ],
+            "Multi-Station": [
+                multi_errors[k]
+                for k in [
+                    "relative_x",
+                    "relative_y",
+                    "relative_z",
+                    "3d_distance",
+                    "3d_median",
+                ]
+            ],
+        },
+        index=["X Error", "Y Error", "Z Error", "3D Mean Error", "3D Median Error"],
+    )
+
+    # Calculate improvement
+    comparison["Improvement (%)"] = (
+        (comparison["Best-Station"] - comparison["Multi-Station"])
+        / comparison["Best-Station"]
+        * 100
+    )
+
+    print("\nXGBoost Error Comparison:")
+    print(comparison)
+
+    # Visualize comparison
+    plt.figure(figsize=(12, 8))
+    bar_width = 0.35
+    index = np.arange(len(comparison.index))
+
+    plt.bar(
+        index - bar_width / 2,
+        comparison["Best-Station"],
+        bar_width,
+        label="Best-Station",
+    )
+    plt.bar(
+        index + bar_width / 2,
+        comparison["Multi-Station"],
+        bar_width,
+        label="Multi-Station",
+    )
+
+    # Add improvement annotations
+    for i, imp in enumerate(comparison["Improvement (%)"]):
+        if imp > 0:  # Only show positive improvements
+            plt.text(
+                i + bar_width / 2,
+                comparison["Multi-Station"].iloc[i] + 1,
+                f"+{imp:.1f}%",
+                ha="center",
+                va="bottom",
+                color="green",
+                fontweight="bold",
+            )
+
+    plt.xlabel("Error Metric")
+    plt.ylabel("Error (km)")
+    plt.title("XGBoost: Best-Station vs. Multi-Station Approach Comparison")
+    plt.xticks(index, comparison.index)
+    plt.legend()
+    plt.grid(axis="y", linestyle="--", alpha=0.7)
+    plt.savefig(f"{results_dir}/xgboost_approach_comparison.png", dpi=300)
+    plt.tight_layout()
+
+    # Analyze error distributions
+    plt.figure(figsize=(12, 6))
+    sns.histplot(
+        results_best["test_results"]["errors"]["3d"],
+        kde=True,
+        color="blue",
+        alpha=0.5,
+        label="Best-Station",
+    )
+    sns.histplot(
+        results_multi["test_results"]["errors"]["3d"],
+        kde=True,
+        color="red",
+        alpha=0.5,
+        label="Multi-Station",
+    )
+    plt.axvline(
+        np.mean(results_best["test_results"]["errors"]["3d"]),
+        color="blue",
+        linestyle="--",
+        label=f'Best-Station Mean: {np.mean(results_best["test_results"]["errors"]["3d"]):.2f} km',
+    )
+    plt.axvline(
+        np.mean(results_multi["test_results"]["errors"]["3d"]),
+        color="red",
+        linestyle="--",
+        label=f'Multi-Station Mean: {np.mean(results_multi["test_results"]["errors"]["3d"]):.2f} km',
+    )
+    plt.xlabel("3D Error (km)")
+    plt.ylabel("Frequency")
+    plt.title("XGBoost: Error Distribution Comparison")
+    plt.legend()
+    plt.grid(linestyle="--", alpha=0.7)
+    plt.savefig(f"{results_dir}/xgboost_error_distribution_comparison.png", dpi=300)
+    plt.tight_layout()
+
+
+    print(f"\nComparison results saved to {results_dir}/")
+
+    return comparison, results_best, results_multi
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Train XGBoost models for aftershock location prediction"
+    )
+    parser.add_argument(
+        "--data",
+        required=True,
+        help="Path to pickle file with preprocessed data"
+    )
+    parser.add_argument(
+        "--validation",
+        choices=["none", "critical", "full"],
+        default="full",
+        help="Validation level (default: full)"
+    )
+    parser.add_argument(
+        "--approach",
+        choices=["best_station", "multi_station", "compare"],
+        default="compare",
+        help="Analysis approach (default: compare both)"
+    )
+    parser.add_argument(
+        "--results-dir",
+        default="xgboost_results",
+        help="Directory to save results (default: xgboost_results)"
+    )
+    # Removed the --tune argument
+
+    args = parser.parse_args()
+
+    # Create results directory if it doesn't exist
+    os.makedirs(args.results_dir, exist_ok=True)
+
+    if args.approach == "compare":
+        # Run comparison of both approaches
+        comparison, results_best, results_multi = compare_approaches(
+            args.data, 
+            validation_level=args.validation,
+            results_dir=args.results_dir
+        )
+    else:
+        # Run single approach
+        predictor = XGBoostAfterShockPredictor(
+            data_file=args.data,
+            validation_level=args.validation,
+            approach=args.approach,
+        )
+        results = predictor.run_complete_workflow()
+
+
+    # predictor = XGBoostAfterShockPredictor(
+    #     data_file=args.data,
+    #     validation_level='none',  # Faster with minimal validation
+    #     approach='best_station'   # Either approach works for this test
+    #     )
+
+    # # Visualize untrained model predictions
+    # untrained_results = predictor.visualize_untrained_predictions()
+
+    print(f"Results saved")
