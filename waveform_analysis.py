@@ -1,3 +1,5 @@
+# waveform_analysis.py
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -220,7 +222,7 @@ def comparative_experiment(seed=42):
         "batch_size": 8,
         "weight_decay": 5e-6,
         "epochs": 100,
-        "patience": 10,
+        "patience": 20,
     }
 
     # Define functions for creating graphs with and without waveform features

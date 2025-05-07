@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
-# xgboost_aftershock_prediction.py - XGBoost-based models for aftershock location prediction
+# lightgbm_aftershock_prediction.py - LightGBM-based models for aftershock location prediction
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import scipy
-from scipy import fft
-from scipy.signal import butter, filtfilt
-from scipy.optimize import curve_fit
 import seaborn as sns
 from sklearn.model_selection import train_test_split, GroupKFold, RandomizedSearchCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.feature_selection import VarianceThreshold
-from xgboost import XGBRegressor
+from lightgbm import LGBMRegressor
 from sklearn.multioutput import MultiOutputRegressor
 import pickle
 from scipy import signal
@@ -27,36 +23,27 @@ import time
 import argparse
 
 
-class XGBoostAfterShockPredictor:
+class LightGBMAfterShockPredictor:
     """
-    Class for predicting aftershock locations using XGBoost models
+    Class for predicting aftershock locations using LightGBM models
     with best-station and multi-station approaches
     """
 
     def __init__(
-        self,
-        data_file=None,
-        validation_level="full",
-        approach="multi_station",
-        feature_type="all",  # Modified: "all", "signal", "intensity", "physics"
+        self, data_pickle=None, validation_level="full", approach="best_station"
     ):
         """
         Initialize the predictor
 
         Args:
-            data_file: Path to pickle or HDF5 file with preprocessed data
+            data_pickle: Path to pickle file with preprocessed data
             validation_level: Level of validation to apply
-                            "full" - all checks
-                            "critical" - only critical checks
-                            "none" - no validation
+                             "full" - all checks
+                             "critical" - only critical checks
+                             "none" - no validation
             approach: Analysis approach to use
-                    "best_station" - use only the best station for each event
-                    "multi_station" - use all available stations for each event
-            feature_type: Type of features to use
-                        "all" - use all features (Tiers A+B+C)
-                        "signal" - use only signal-based features (Tier A)
-                        "intensity" - use signal+intensity features (Tiers A+B)
-                        "physics" - use all features (Tiers A+B+C) [same as "all"]
+                      "best_station" - use only the best station for each event
+                      "multi_station" - use all available stations for each event
         """
         self.data_dict = None
         self.aftershocks_df = None
@@ -68,39 +55,17 @@ class XGBoostAfterShockPredictor:
         self.validation_level = validation_level
         self.validation_results = {}
         self.approach = approach
-        self.feature_type = feature_type
         self.data_format = None  # Will be set when loading data
 
         print(f"Validation level: {validation_level}")
         print(f"Analysis approach: {approach}")
-        print(f"Feature type: {feature_type}")
-        
-        # Print more detailed feature tier description
-        if feature_type == "signal":
-            print("Using Tier A (signal statistics) features only")
-        elif feature_type == "intensity":
-            print("Using Tier A+B (signal + intensity/site) features")
-        elif feature_type in ["physics", "all"]:
-            print("Using all features (Tiers A+B+C: signal + intensity + source physics)")
 
         # Load data
-        if data_file and os.path.exists(data_file):
-            print(f"Loading data from {data_file}")
-            # Determine file type by extension
-            if data_file.lower().endswith(".pkl") or data_file.lower().endswith(
-                ".pickle"
-            ):
-                self.data_dict = self.load_from_pickle(data_file)
-            elif data_file.lower().endswith(".h5") or data_file.lower().endswith(
-                ".hdf5"
-            ):
-                self.data_dict = self.load_from_hdf5(data_file)
-            else:
-                raise ValueError(
-                    f"Unsupported file type: {data_file}. Must be .pkl, .pickle, .h5, or .hdf5"
-                )
+        if data_pickle and os.path.exists(data_pickle):
+            print(f"Loading data from {data_pickle}")
+            self.data_dict = self.load_from_pickle(data_pickle)
         else:
-            print("No file found or invalid path provided.")
+            print("No pickle file found or invalid path provided.")
             return
 
         # Standardize waveform lengths BEFORE data integrity validation
@@ -134,152 +99,6 @@ class XGBoostAfterShockPredictor:
         else:
             print("Detected single-station data format")
             self.data_format = "single_station"
-
-        return data_dict
-
-    def load_from_hdf5(self, hdf5_path):
-        """
-        Load data from an HDF5 file with support for multi-station format
-
-        Args:
-            hdf5_path: Path to the HDF5 file
-
-        Returns:
-            Dictionary with event data in the expected format
-        """
-        import h5py
-        import numpy as np
-
-        print(f"Loading data from HDF5 file: {hdf5_path}")
-
-        data_dict = {}
-
-        with h5py.File(hdf5_path, "r") as h5f:
-            # Check metadata
-            if "metadata" in h5f:
-                total_events = h5f["metadata"].attrs.get("total_events", 0)
-                total_stations = h5f["metadata"].attrs.get("total_stations", 0)
-                print(
-                    f"HDF5 file contains {total_events} events and {total_stations} total station recordings"
-                )
-
-            # Check if 'events' group exists
-            if "events" not in h5f:
-                raise ValueError(
-                    f"Invalid HDF5 file structure: 'events' group not found in {hdf5_path}"
-                )
-
-            # Get all event keys
-            events_group = h5f["events"]
-
-            # Determine data format by checking the structure
-            is_multi_station = False
-            for event_key in events_group:
-                event_group = events_group[event_key]
-                if "stations" in event_group:
-                    is_multi_station = True
-                    break
-
-            if is_multi_station:
-                print("Detected multi-station data format in HDF5 file")
-                self.data_format = "multi_station"
-            else:
-                print("Detected single-station data format in HDF5 file")
-                self.data_format = "single_station"
-
-            # Process all events
-            for event_key in events_group:
-                event_group = events_group[event_key]
-
-                # Get event metadata
-                if "event_metadata" in event_group:
-                    origin_time = event_group["event_metadata"].attrs[
-                        "source_origin_time"
-                    ]
-                    lat = float(
-                        event_group["event_metadata"].attrs["source_latitude_deg"]
-                    )
-                    lon = float(
-                        event_group["event_metadata"].attrs["source_longitude_deg"]
-                    )
-                    depth = float(
-                        event_group["event_metadata"].attrs["source_depth_km"]
-                    )
-
-                    # Create event tuple key
-                    event_tuple = (origin_time, lat, lon, depth)
-
-                    if is_multi_station:
-                        # Process multi-station format
-                        if "stations" in event_group:
-                            stations_group = event_group["stations"]
-                            stations_data = {}
-
-                            for station_key in stations_group:
-                                station_group = stations_group[station_key]
-
-                                # Replace underscore with dot for station key (h5 doesn't like dots in group names)
-                                real_station_key = station_key.replace("_", ".")
-
-                                # Get waveform data
-                                waveform = station_group["waveform"][:]
-
-                                # Get metadata
-                                metadata = {}
-                                if "metadata" in station_group:
-                                    for key, value in station_group[
-                                        "metadata"
-                                    ].attrs.items():
-                                        # Convert special values if needed
-                                        if value == "NA":
-                                            metadata[key] = None
-                                        else:
-                                            metadata[key] = value
-
-                                # Get station distance and score
-                                station_distance = float(
-                                    station_group.attrs.get("station_distance", 0)
-                                )
-                                selection_score = float(
-                                    station_group.attrs.get("selection_score", 0)
-                                )
-
-                                # Create station entry
-                                stations_data[real_station_key] = {
-                                    "metadata": metadata,
-                                    "waveform": waveform,
-                                    "station_distance": station_distance,
-                                    "selection_score": selection_score,
-                                }
-
-                            # Add to data dictionary
-                            data_dict[event_tuple] = stations_data
-                    else:
-                        # Process single-station format
-                        if "waveform" in event_group:
-                            waveform = event_group["waveform"][:]
-
-                            # Get metadata
-                            metadata = {}
-                            if "metadata" in event_group:
-                                for key, value in event_group["metadata"].attrs.items():
-                                    if value == "NA":
-                                        metadata[key] = None
-                                    else:
-                                        metadata[key] = value
-
-                            # Create event entry
-                            data_dict[event_tuple] = {
-                                "metadata": metadata,
-                                "waveform": waveform,
-                            }
-
-            print(f"Successfully loaded {len(data_dict)} events from HDF5 file")
-
-            # Check for multi-station data
-            if is_multi_station:
-                total_stations = sum(len(stations) for stations in data_dict.values())
-                print(f"Total station recordings: {total_stations}")
 
         return data_dict
 
@@ -466,35 +285,6 @@ class XGBoostAfterShockPredictor:
 
         return self.aftershocks_df
 
-    def remove_specific_features(self, X, features_to_remove=["pol_inc_min"]):
-        """
-        Remove specific features from the dataset
-
-        Args:
-            X: Feature dataframe
-            features_to_remove: List of feature names to remove
-
-        Returns:
-            DataFrame with features removed
-        """
-        X_filtered = X.copy()
-
-        # Find all columns that match any of the patterns to remove
-        columns_to_remove = []
-        for pattern in features_to_remove:
-            matching_cols = [col for col in X.columns if pattern in col]
-            columns_to_remove.extend(matching_cols)
-
-        # Remove the columns if they exist
-        existing_columns = [col for col in columns_to_remove if col in X.columns]
-        if existing_columns:
-            print(f"Removing {len(existing_columns)} features: {existing_columns}")
-            X_filtered = X_filtered.drop(columns=existing_columns)
-        else:
-            print(f"No matching features found for patterns: {features_to_remove}")
-
-        return X_filtered
-
     @staticmethod
     def geographic_to_cartesian(lat, lon, depth, ref_lat, ref_lon, ref_depth):
         """
@@ -560,587 +350,82 @@ class XGBoostAfterShockPredictor:
 
     def extract_waveform_features(self, waveform, metadata=None):
         """
-        Extract features from the 3-component waveform data based on selected feature type
-        
-        Feature types are organized in tiers:
-        - "signal": Basic signal statistics (Tier A)
-        - "intensity": Ground-motion intensity measures and site metrics (Tier B)
-        - "physics": Source physics parameters requiring explicit models (Tier C)
-        - "all": All feature types
-        
+        Extract features from the 3-component waveform data
+
         Args:
             waveform: 3-component seismic waveform array
             metadata: Optional metadata dictionary for the station
         """
         features = {}
 
-        # ---- COUNTS → VELOCITY CONVERSION for STS-2 ----
-        sts2_sensitivity = 1500.0             # V per (m/s)
-        V_per_count     = 40.0 / 2**24        # V/count (±20 V 24-bit)
-        gain            = 1.0                 # additional preamp gain (if any)
-        waveform_ms = waveform * (V_per_count / (sts2_sensitivity * gain))
-
-        # Assume sampling rate of 100 Hz
-        sampling_rate = 100.0
-        g = 9.81  # Gravitational acceleration in m/s^2
-        
-        # Define Brune model constants once
-        rho = 2700.0  # kg m⁻³ (crustal density)
-        beta = 3.5e3  # m s⁻¹ (shear‑wave velocity 3.5 km/s)
-        k = 0.37      # Brune constant
-        mu = 30e9     # Shear modulus (Pa), typically ~30 GPa for crustal rocks
-
-        def fit_omega_squared_model(displ_spec, freqs):
-            """
-            Fit the ω² model |U(f)| = Ω0 / (1 + (f/fc)**2) to a displacement spectrum.
-
-            Args:
-                displ_spec: 1D array of displacement spectral amplitudes |U(f)|.
-                freqs:       1D array of corresponding frequencies (Hz).
-
-            Returns:
-                fc: float, corner frequency (Hz)
-                Omega0: float, low-frequency level (same units as displ_spec)
-            """
-            try:
-                # Only fit where spectrum is above noise and away from edges:
-                mask = (freqs > 0.5) & (freqs < freqs.max()*0.8)
-                f_fit = freqs[mask]
-                U_fit = displ_spec[mask]
-
-                # Define the ω² model function
-                def omega2_model(f, Omega0, fc):
-                    return Omega0 / (1.0 + (f/fc)**2)
-
-                # Initial guesses: plateau ~ median spectrum at low freq, fc ~ 1 Hz
-                p0 = [np.median(U_fit[:10]), 1.0]
-
-                # Bound fc to positive
-                popt, _ = curve_fit(omega2_model, f_fit, U_fit, p0=p0, bounds=([0, 0], [np.inf, np.inf]), maxfev=10000)
-                Omega0, fc = popt
-                return fc, Omega0
-            except:
-                # If fitting fails (e.g., low SNR), return NaN values
-                return np.nan, np.nan
-
-        # Optional: Dynamic low-cut based on record length to ensure stability
-        trace_length = waveform_ms.shape[1] / sampling_rate  # in seconds
-        low = max(0.02, 1.5 / trace_length)  # Ensure filter stability for short traces
-        
-        b, a = butter(4, [low/(sampling_rate/2), 40/(sampling_rate/2)], 'bandpass')
-        b_hp, a_hp = butter(2, 0.05/(sampling_rate/2), btype="highpass")
-
-        # Store filtered components for cross-component analysis
-        velocity_filtered_components = []
-        
-        # Store PGV values for H/V ratio calculation later
-        PGV = {}
-        
-        # Process each component
+        # Basic shape features
         for i, component in enumerate(["Z", "N", "E"]):
-            velocity_filtered = filtfilt(b, a, waveform_ms[i])
-            velocity_filtered_components.append(velocity_filtered)
+            # Simple statistics
+            features[f"{component}_mean"] = np.mean(waveform[i])
+            features[f"{component}_std"] = np.std(waveform[i])
+            features[f"{component}_max"] = np.max(waveform[i])
+            features[f"{component}_min"] = np.min(waveform[i])
+            features[f"{component}_range"] = np.ptp(waveform[i])
+            features[f"{component}_energy"] = np.sum(waveform[i] ** 2)
 
-            # Calculate spectrum on filtered velocity
-            f, Pxx = signal.welch(velocity_filtered, fs=sampling_rate, nperseg=1024)
+            # RMS
+            features[f"{component}_rms"] = np.sqrt(np.mean(waveform[i] ** 2))
 
-            # TIER A: Low-level signal statistics 
-            if self.feature_type in ["all", "signal", "intensity", "physics"]:
-                # Simple statistics (now on filtered velocity)
-                features[f"{component}_mean"] = np.mean(velocity_filtered)
-                features[f"{component}_std"] = np.std(velocity_filtered)
-                features[f"{component}_range"] = np.ptp(velocity_filtered)
-                features[f"{component}_energy"] = np.sum(velocity_filtered ** 2)
+            # Zero crossings
+            features[f"{component}_zero_crossings"] = np.sum(
+                np.diff(np.signbit(waveform[i]))
+            )
 
-                # RMS
-                features[f"{component}_rms"] = np.sqrt(np.mean(velocity_filtered ** 2))
+            # Spectral features
+            f, Pxx = signal.welch(waveform[i], fs=100, nperseg=256)
+            features[f"{component}_peak_freq"] = f[np.argmax(Pxx)]
+            features[f"{component}_spectral_mean"] = np.mean(Pxx)
+            features[f"{component}_spectral_std"] = np.std(Pxx)
 
-                # Zero crossings
-                features[f"{component}_zero_crossings"] = np.sum(
-                    np.diff(np.signbit(velocity_filtered))
-                )
+            # Frequency bands energy
+            band_ranges = [(0, 5), (5, 10), (10, 20), (20, 40)]
+            for j, (low, high) in enumerate(band_ranges):
+                mask = (f >= low) & (f <= high)
+                features[f"{component}_band_{low}_{high}_energy"] = np.sum(Pxx[mask])
 
-                # Spectral features
-                features[f"{component}_peak_freq"] = f[np.argmax(Pxx)]
-                features[f"{component}_spectral_mean"] = np.mean(Pxx)
-                features[f"{component}_spectral_std"] = np.std(Pxx)
+        # Cross-component features
+        features["Z_N_correlation"] = np.corrcoef(waveform[0], waveform[1])[0, 1]
+        features["Z_E_correlation"] = np.corrcoef(waveform[0], waveform[2])[0, 1]
+        features["N_E_correlation"] = np.corrcoef(waveform[1], waveform[2])[0, 1]
 
-                # Frequency bands energy
-                band_ranges = [(0, 5), (5, 10), (10, 20), (20, 40)]
-                for j, (low, high) in enumerate(band_ranges):
-                    mask = (f >= low) & (f <= high)
-                    features[f"{component}_band_{low}_{high}_energy"] = np.sum(
-                        Pxx[mask]
-                    )
-                    
-            # TIER B: Ground-motion intensity & site metrics
-            if self.feature_type in ["all", "intensity"]:
-                acceleration = np.gradient(velocity_filtered, 1/sampling_rate)
-                displacement = scipy.integrate.cumulative_trapezoid(velocity_filtered, dx=1/sampling_rate, initial=0)
-                displacement_filtered = filtfilt(b_hp, a_hp, displacement)
-                
-                # Ground motion intensity measures (no source model)
-                features[f"{component}_PGV"] = np.max(np.abs(velocity_filtered))
-                features[f"{component}_PGA"] = np.max(np.abs(acceleration))
-                features[f"{component}_PGD"] = np.max(np.abs(displacement_filtered))
-                
-                # Spectral statistics (no source model)
-                # High/low frequency spectral ratio (stress indicator)
-                hf_mask_ratio = (f >= 8) & (f <= 25)     # 8–25 Hz
-                lf_mask_ratio = (f >= 0.8) & (f <= 2.0)
+        # Add polarization features (critical for baseline comparison)
+        features["pol_az"] = np.degrees(
+            np.arctan2(np.std(waveform[2]), np.std(waveform[1]))
+        )  # Azimuth
+        features["pol_inc"] = np.degrees(
+            np.arctan2(
+                np.sqrt(np.std(waveform[1]) ** 2 + np.std(waveform[2]) ** 2),
+                np.std(waveform[0]),
+            )
+        )  # Incidence
+        features["rect_lin"] = 1 - (
+            np.min([np.std(waveform[0]), np.std(waveform[1]), np.std(waveform[2])])
+            / np.max([np.std(waveform[0]), np.std(waveform[1]), np.std(waveform[2])])
+        )  # Rectilinearity
 
-                if np.any(hf_mask_ratio) and np.any(lf_mask_ratio):
-                    hf = np.mean(Pxx[hf_mask_ratio])
-                    lf = np.mean(Pxx[lf_mask_ratio])
-                    features[f"{component}_hf_lf_ratio"] = hf / lf if lf > 0 else 0
-                else:
-                    features[f"{component}_hf_lf_ratio"] = 0
-                    
-                # Low-frequency spectral plateau (related to seismic moment but not requiring model)
-                lf_mask = f < 1.0
-                if np.any(lf_mask):
-                    lf_level = np.mean(Pxx[lf_mask])
-                    features[f"{component}_lf_spectral_level"] = lf_level
-                else:
-                    features[f"{component}_lf_spectral_level"] = 0
-
-                
-                # 2. Kappa (κ) - HF decay constant (site metric, no source model)
-                f_k, Paa = signal.welch(acceleration, fs=sampling_rate, nperseg=1024)
-                mask_k = (f_k >= 10) & (f_k <= 25)
-                if np.sum(mask_k) >= 5:
-                    try:
-                        slope_k, _ = np.polyfit(f_k[mask_k], np.log(Paa[mask_k]), 1)
-                        kappa = -slope_k / np.pi
-                        features[f"{component}_kappa"] = kappa
-                    except:
-                        features[f"{component}_kappa"] = np.nan
-                else:
-                    features[f"{component}_kappa"] = np.nan
-                
-                # # 3. Spectral Centroid (pure spectral statistic)
-                # mask_centroid = (f >= 0.5) & (f <= 30)
-                # if np.sum(mask_centroid) >= 5 and np.sum(Pxx[mask_centroid]) > 0:
-                #     f_cen = np.sum(f[mask_centroid] * Pxx[mask_centroid]) / np.sum(Pxx[mask_centroid])
-                #     features[f"{component}_spectral_centroid"] = f_cen
-                # else:
-                #     features[f"{component}_spectral_centroid"] = np.nan
-                
-                # # 4. Coda-to-direct energy ratio (site/scattering metric, no source model)
-                # winsamp = lambda t_sec: min(int(t_sec * sampling_rate), len(velocity_filtered)-1)
-                # if winsamp(50) < len(velocity_filtered):  # Ensure we have enough signal length
-                #     E_dir = np.sum(velocity_filtered[winsamp(0):winsamp(5)]**2)
-                #     E_coda = np.sum(velocity_filtered[winsamp(20):winsamp(50)]**2)
-                #     features[f"{component}_coda_ratio"] = E_coda / (E_dir + 1e-15)
-                # else:
-                #     features[f"{component}_coda_ratio"] = np.nan
-
-            # TIER C: Source physics parameters (requiring physical model)
-            if self.feature_type in ["all", "physics"]:
-                # FIXED: Always compute these unconditionally for each component 
-                # to avoid inheriting bad values from previous component
-                acceleration = np.gradient(velocity_filtered, 1/sampling_rate)
-                displacement = scipy.integrate.cumulative_trapezoid(velocity_filtered, dx=1/sampling_rate, initial=0)
-                disp_for_spec = displacement  # no HP filtering for spectrum
-                
-                # Compute displacement amplitude spectrum:
-                n = len(disp_for_spec)
-                # FFT and take absolute; only positive freqs:
-                U = np.abs(fft.rfft(disp_for_spec * np.hanning(n)))
-                freqs = fft.rfftfreq(n, d=1/sampling_rate)
-
-                # Fit ω²‐model:
-                fc, Omega0 = fit_omega_squared_model(U, freqs)
-                features[f"{component}_corner_freq"] = fc
-                features[f"{component}_Omega0"] = Omega0
-
-                # ---------- SOURCE / SPECTRAL PHYSICS EXTRAS ----------
-                # 1) Brune seismic moment (units: N·m, but only ratios matter here)
-                M0 = Omega0 * (4 * np.pi * rho * beta**3)  # proportional
-                features[f"{component}_M0_proxy"] = M0
-                
-                # 2) Brune stress‑drop using M0 with NaN/zero guard
-                if np.isfinite(fc) and fc > 0:
-                    r_brune = k * beta / fc  # metres
-                    DSigma = 7./16. * M0 / (r_brune**3)  # Pa, up to scale
-                else:
-                    r_brune = np.nan
-                    DSigma = np.nan
-                    
-                features[f"{component}_stress_drop"] = DSigma
-                
-                # # 3) High‑frequency excess slope (> 2 fc) with proper guards
-                # if np.isfinite(fc) and (freqs[1] < 2*fc < freqs[-1]*0.8) and np.sum((freqs >= 2*fc) & (freqs <= 0.8*sampling_rate/2)) >= 8:
-                #     hf_mask_slope = (freqs >= 2*fc) & (freqs <= 0.8*sampling_rate/2)
-                #     try:
-                #         slope, _ = np.polyfit(freqs[hf_mask_slope], np.log(U[hf_mask_slope]), 1)
-                #         features[f"{component}_hf_slope"] = slope  # Brune ≈ −2
-                #     except:
-                #         features[f"{component}_hf_slope"] = np.nan
-                # else:
-                #     features[f"{component}_hf_slope"] = np.nan
-                    
-                # # 4) Moment‑rate spectral areas with guards
-                # if np.isfinite(fc) and fc > 0.5:
-                #     low_mask = (freqs>=0.5) & (freqs<=fc)
-                #     high_mask = (freqs>=fc) & (freqs<=freqs.max())
-                    
-                #     if np.sum(low_mask) >= 5:  # Ensure enough points for integration
-                #         A_low = np.trapz(U[low_mask], freqs[low_mask])
-                #     else:
-                #         A_low = np.nan
-                        
-                #     if np.sum(high_mask) >= 5:
-                #         A_high = np.trapz(U[high_mask], freqs[high_mask])
-                #     else:
-                #         A_high = np.nan
-                        
-                #     features[f"{component}_spectral_area_low"] = A_low
-                #     features[f"{component}_spectral_area_high"] = A_high
-                    
-                #     if np.isfinite(A_low) and np.isfinite(A_high) and A_low > 0:
-                #         features[f"{component}_area_ratio"] = A_high / A_low
-                #     else:
-                #         features[f"{component}_area_ratio"] = np.nan
-                # else:
-                #     features[f"{component}_spectral_area_low"] = np.nan
-                #     features[f"{component}_spectral_area_high"] = np.nan
-                #     features[f"{component}_area_ratio"] = np.nan
-                    
-                # ---- ADDITIONAL PHYSICS-BASED SOURCE PARAMETERS ----
-                
-                # 1) Seismic moment magnitude (Mw) - Hanks-Kanamori formula
-                if np.isfinite(M0) and M0 > 0:
-                    Mw = (2.0/3.0) * np.log10(M0) - 6.06
-                    features[f"{component}_Mw"] = Mw
-                else:
-                    features[f"{component}_Mw"] = np.nan
-                    
-                # 2) Radiated seismic energy (ER) - FIXED
-                # Now using velocity amplitude spectrum instead of Welch PSD
-                # and correct scaling 4π ρ β⁵ for S-waves (Aki & Richards)
-                
-                # # Compute velocity amplitude spectrum for the component
-                # V = np.abs(fft.rfft(velocity_filtered * np.hanning(len(velocity_filtered))))
-                # V_freqs = fft.rfftfreq(len(velocity_filtered), d=1/sampling_rate)
-                
-                # # Integrate velocity spectrum energy and apply correct physical scaling
-                # if np.any(V > 0):
-                #     # Integrate over frequency band with reliable SNR
-                #     vel_mask = (V_freqs >= 0.5) & (V_freqs <= min(40, sampling_rate/2 * 0.8))
-                #     # FIXED: Use β⁵ instead of β³
-                #     Er = 4 * np.pi * rho * beta**5 * np.trapz(V[vel_mask]**2, V_freqs[vel_mask])
-                #     features[f"{component}_Er"] = Er
-                # else:
-                #     features[f"{component}_Er"] = np.nan
-                    
-                # 3) Source radius (r) - already calculated as r_brune
-                if np.isfinite(r_brune):
-                    features[f"{component}_source_radius"] = r_brune
-                else:
-                    features[f"{component}_source_radius"] = np.nan
-                    
-                # 4) Rupture area (A) - circular model
-                if np.isfinite(r_brune):
-                    rupture_area = np.pi * r_brune**2
-                    features[f"{component}_rupture_area"] = rupture_area
-                else:
-                    features[f"{component}_rupture_area"] = np.nan
-                    
-                # # 5) Apparent stress (σa)
-                # if np.isfinite(M0) and M0 > 0 and np.isfinite(features.get(f"{component}_Er", np.nan)):
-                #     sigma_a = mu * features[f"{component}_Er"] / M0
-                #     features[f"{component}_apparent_stress"] = sigma_a
-                # else:
-                #     features[f"{component}_apparent_stress"] = np.nan
-                    
-                # 6) Average slip (D)
-                if np.isfinite(M0) and np.isfinite(features.get(f"{component}_rupture_area", np.nan)) and features[f"{component}_rupture_area"] > 0:
-                    avg_slip = M0 / (mu * features[f"{component}_rupture_area"])
-                    features[f"{component}_avg_slip"] = avg_slip
-                else:
-                    features[f"{component}_avg_slip"] = np.nan
-
-        # TIER A: Cross-component signal statistics
-        if self.feature_type in ["all", "signal", "intensity"]:
-            features["Z_N_correlation"] = np.corrcoef(velocity_filtered_components[0], velocity_filtered_components[1])[0, 1]
-            features["Z_E_correlation"] = np.corrcoef(velocity_filtered_components[0], velocity_filtered_components[2])[0, 1]
-            features["N_E_correlation"] = np.corrcoef(velocity_filtered_components[1], velocity_filtered_components[2])[0, 1]
-
-        # TIER B: Polarization & site features (no source model)
-        if self.feature_type in ["all", "intensity"]:
-            # Polarization features
-            features["pol_az"] = np.degrees(
-                np.arctan2(np.std(velocity_filtered_components[2]), np.std(velocity_filtered_components[1]))
-            )  # Azimuth
-            features["pol_inc"] = np.degrees(
-                np.arctan2(
-                    np.sqrt(np.std(velocity_filtered_components[1]) ** 2 + np.std(velocity_filtered_components[2]) ** 2),
-                    np.std(velocity_filtered_components[0]),
-                )
-            )  # Incidence
-            cov_matrix = np.cov([velocity_filtered_components[0], velocity_filtered_components[1], velocity_filtered_components[2]])
-            eigenvalues = np.sort(np.linalg.eigvals(cov_matrix))[::-1]
-            features["rect_lin"] = 1 - (eigenvalues[1] + eigenvalues[2]) / (2 * eigenvalues[0])  # Rectilinearity
-        
-            # # 5. Horizontal-to-Vertical PGV ratio (site metric, no source model)
-            # if "N" in PGV and "E" in PGV and "Z" in PGV:
-            #     PGV_H = np.sqrt(PGV["N"]**2 + PGV["E"]**2)
-            #     features["HV_PGV_ratio"] = PGV_H / (PGV["Z"] + 1e-15)
-                
-        # TIER C: Corner-frequency anisotropy (source physics metric)
-        if self.feature_type in ["all", "physics"]:
-            fc_Z = features.get("Z_corner_freq", np.nan)
-            fc_N = features.get("N_corner_freq", np.nan)
-            fc_E = features.get("E_corner_freq", np.nan)
-            if np.isfinite(fc_Z) and np.isfinite(fc_N) and np.isfinite(fc_E):
-                fc_Hgeom = np.sqrt(fc_N * fc_E)  # geometric mean horizontal
-                features["fc_anisotropy"] = fc_Z - fc_Hgeom  # Hz
-            else:
-                features["fc_anisotropy"] = np.nan
+        # Extract P-S time difference if available
+        if (
+            isinstance(metadata, dict)
+            and "trace_P_arrival_sample" in metadata
+            and "trace_S_arrival_sample" in metadata
+        ):
+            if pd.notna(metadata["trace_P_arrival_sample"]) and pd.notna(
+                metadata["trace_S_arrival_sample"]
+            ):
+                p_sample = metadata["trace_P_arrival_sample"]
+                s_sample = metadata["trace_S_arrival_sample"]
+                if p_sample < s_sample:  # Ensure P arrives before S
+                    # Convert samples to time (assuming 100 Hz sampling rate)
+                    features["p_s_time_diff"] = (
+                        s_sample - p_sample
+                    ) / 100.0  # in seconds
 
         return features
-
-    def perform_shap_analysis(self, X_test, y_test, max_display=20):
-        """
-        Perform SHAP analysis on the trained XGBoost models to interpret feature importance
-        and feature contributions to individual predictions.
-
-        Args:
-            X_test: Test feature dataset
-            y_test: Test target dataset
-            max_display: Maximum number of features to display in SHAP plots
-
-        Returns:
-            Dictionary containing SHAP values and explanations
-        """
-        import shap
-        import matplotlib.pyplot as plt
-        import numpy as np
-
-        if self.models is None:
-            raise ValueError("Models not trained yet. Call train_xgboost_models first.")
-
-        print("\n" + "=" * 50)
-        print("PERFORMING SHAP ANALYSIS")
-        print("=" * 50)
-
-        # Prepare results dictionary
-        shap_results = {"values": {}, "plots": {}, "feature_importance": {}}
-
-        # Set up the explainer
-        coords = ["relative_x", "relative_y", "relative_z"]
-
-        for i, coord in enumerate(coords):
-            print(f"\nAnalyzing SHAP values for {coord} prediction...")
-
-            # Get the XGBoost model for this coordinate
-            xgb_model = self.models["multi_output"].estimators_[i]
-
-            # Initialize the explainer - use TreeExplainer for XGBoost
-            explainer = shap.TreeExplainer(xgb_model)
-
-            # Calculate SHAP values for test set
-            shap_values = explainer(X_test)
-
-            # Store SHAP values
-            shap_results["values"][coord] = shap_values
-
-            # 1. Summary plot (overall feature importance based on SHAP)
-            plt.figure(figsize=(12, 12))
-            shap.summary_plot(
-                shap_values.values,
-                X_test,
-                max_display=max_display,
-                show=False,
-                plot_size=(12, 12),
-            )
-            plt.title(f"SHAP Summary Plot for {coord} Prediction")
-            plt.tight_layout()
-            plt.savefig(
-                f"shap_summary_{coord}_{self.approach}_{self.feature_type}.png",
-                dpi=300,
-                bbox_inches="tight",
-            )
-            plt.close()
-
-            # 2. Bar plot (mean absolute SHAP values)
-            plt.figure(figsize=(12, 10))
-            shap.plots.bar(shap_values, max_display=max_display, show=False)
-            plt.title(f"SHAP Feature Importance for {coord} Prediction")
-            plt.tight_layout()
-            plt.savefig(
-                f"shap_importance_bar_{coord}_{self.approach}_{self.feature_type}.png",
-                dpi=300,
-                bbox_inches="tight",
-            )
-            plt.close()
-
-            # # 3. Beeswarm plot (distribution of SHAP values)
-            # plt.figure(figsize=(12, 12))
-            # shap.plots.beeswarm(shap_values, max_display=max_display, show=False)
-            # plt.title(f"SHAP Value Distribution for {coord} Prediction")
-            # plt.tight_layout()
-            # plt.savefig(
-            #     f"shap_beeswarm_{coord}_{self.approach}_{self.feature_type}.png",
-            #     dpi=300,
-            #     bbox_inches="tight",
-            # )
-            # plt.close()
-
-            # 5. Waterfall plots for selected examples (show detailed feature contribution)
-            # Select 3 examples: one with small error, one with average error, one with large error
-            if (
-                "relative_x" in y_test.columns
-            ):  # Make sure we have actual coords to compare
-                # Predict test samples
-                y_pred = xgb_model.predict(X_test)
-
-                # Calculate prediction errors
-                errors = np.abs(y_test[coord].values - y_pred)
-
-                # Get indices for examples with small, medium, and large errors
-                small_error_idx = errors.argmin()
-                large_error_idx = errors.argmax()
-
-                # Sort errors and find the median error example
-                sorted_indices = np.argsort(errors)
-                medium_error_idx = sorted_indices[len(sorted_indices) // 2]
-
-                example_indices = [small_error_idx, medium_error_idx, large_error_idx]
-                error_types = ["small", "medium", "large"]
-
-                # for idx, error_type in zip(example_indices, error_types):
-                #     plt.figure(figsize=(12, 10))
-                #     shap.plots.waterfall(
-                #         shap_values[idx],
-                #         max_display=15,  # Show more features for waterfall
-                #         show=False,
-                #     )
-                #     plt.title(
-                #         f"{error_type.capitalize()} Error Example: SHAP Waterfall Plot for {coord}"
-                #     )
-                #     plt.tight_layout()
-                #     plt.savefig(
-                #         f"shap_waterfall_{coord}_{error_type}_{self.approach}_{self.feature_type}.png",
-                #         dpi=300,
-                #         bbox_inches="tight",
-                #     )
-                #     plt.close()
-
-                #     # Print actual vs predicted values for this example
-                #     print(f"  {error_type.capitalize()} error example:")
-                #     print(f"    True {coord}: {y_test[coord].iloc[idx]:.2f} km")
-                #     print(f"    Predicted {coord}: {y_pred[idx]:.2f} km")
-                #     print(f"    Error: {errors[idx]:.2f} km")
-
-            # Store feature importance based on SHAP values
-            feature_importance = pd.DataFrame(
-                {
-                    "feature": X_test.columns,
-                    "importance": np.abs(shap_values.values).mean(0),
-                }
-            ).sort_values("importance", ascending=False)
-
-            shap_results["feature_importance"][coord] = feature_importance
-
-            # Print top features based on SHAP
-            print(f"\nTop features for {coord} prediction (SHAP-based):")
-            print(feature_importance.head(10))
-
-        # 6. Global Analysis - Compare SHAP vs. native XGBoost feature importance
-        for coord in coords:
-            plt.figure(figsize=(12, 8))
-
-            # Get top 20 features from both methods
-            xgb_importance = self.feature_importances[coord].head(20)
-            shap_importance = shap_results["feature_importance"][coord].head(20)
-
-            # Merge the two
-            merged_importance = pd.merge(
-                xgb_importance,
-                shap_importance,
-                on="feature",
-                how="outer",
-                suffixes=("_xgb", "_shap"),
-            ).fillna(0)
-
-            # Filter to get features that appear in either top 20
-            top_features = merged_importance[
-                (merged_importance["importance_xgb"] > 0)
-                | (merged_importance["importance_shap"] > 0)
-            ].sort_values("importance_shap", ascending=True)
-
-            # Normalize for comparison
-            top_features["importance_xgb"] = (
-                top_features["importance_xgb"] / top_features["importance_xgb"].max()
-            )
-            top_features["importance_shap"] = (
-                top_features["importance_shap"] / top_features["importance_shap"].max()
-            )
-
-            # # Plot
-            # fig, ax = plt.subplots(figsize=(12, max(8, len(top_features) * 0.3)))
-
-            # x = np.arange(len(top_features))
-            # width = 0.35
-
-            # ax.barh(
-            #     x - width / 2,
-            #     top_features["importance_xgb"],
-            #     width,
-            #     label="XGBoost Native",
-            # )
-            # ax.barh(
-            #     x + width / 2,
-            #     top_features["importance_shap"],
-            #     width,
-            #     label="SHAP-based",
-            # )
-
-            # ax.set_yticks(x)
-            # ax.set_yticklabels(top_features["feature"])
-            # ax.set_xlabel("Normalized Importance")
-            # ax.set_title(f"XGBoost vs. SHAP Feature Importance: {coord}")
-            # ax.legend()
-
-            # plt.tight_layout()
-            # plt.savefig(
-            #     f"importance_comparison_{coord}_{self.approach}_{self.feature_type}.png",
-            #     dpi=300,
-            #     bbox_inches="tight",
-            # )
-            # plt.close()
-
-        # 7. Create a consolidated feature importance plot for all coordinates
-        plt.figure(figsize=(15, 12))
-
-        # Set up subplots
-        fig, axes = plt.subplots(len(coords), 1, figsize=(15, 5 * len(coords)))
-
-        for i, coord in enumerate(coords):
-            # Get top 15 features based on SHAP
-            top_features = shap_results["feature_importance"][coord].head(15)
-
-            # Create bar plot
-            axes[i].barh(top_features["feature"], top_features["importance"])
-            axes[i].set_title(f"Top 15 Features for {coord} (SHAP Analysis)")
-            axes[i].set_xlabel("Mean |SHAP Value|")
-
-            # Add grid for readability
-            axes[i].grid(axis="x", linestyle="--", alpha=0.6)
-
-        plt.tight_layout()
-        plt.savefig(
-            f"shap_consolidated_{self.approach}_{self.feature_type}.png",
-            dpi=300,
-            bbox_inches="tight",
-        )
-        plt.close()
-
-        print(f"\nSHAP analysis completed. All visualizations saved.")
-
-        return shap_results
 
     def prepare_best_station_dataset(self):
         """
@@ -1261,7 +546,6 @@ class XGBoostAfterShockPredictor:
     def prepare_multi_station_dataset(self):
         """
         Advanced method to prepare dataset using multiple stations for each event
-        with improved station selection, distribution statistics, and reduced redundancy
         """
         if self.aftershocks_df is None:
             self.create_relative_coordinate_dataframe()
@@ -1281,27 +565,23 @@ class XGBoostAfterShockPredictor:
             self.aftershocks_df.iterrows(), total=len(self.aftershocks_df)
         ):
             try:
-                # Extract features with metadata
+                # Extract features with metadata - STATION COORDINATES WILL NOT BE ADDED
                 metadata = row.get("metadata", {})
                 features = self.extract_waveform_features(
                     row["waveform"], metadata=metadata
                 )
-                
-                # Add necessary metadata needed for aggregation later
+
+                # Add station metadata that doesn't leak target information
                 features["station_key"] = row.get("station_key", "")
                 features["event_id"] = row.get("event_id", "")
                 features["origin_time"] = row["origin_time"]
                 features["event_date"] = row["event_date"]
+
+                # Add target values (for later aggregation)
                 features["relative_x"] = row["relative_x"]
                 features["relative_y"] = row["relative_y"]
                 features["relative_z"] = row["relative_z"]
                 features["is_mainshock"] = row["is_mainshock"]
-                
-                # Add station_distance ONLY for ranking purposes (prefixed to mark it)
-                if "station_distance" in row:
-                    features["_ranking_station_distance"] = row["station_distance"]
-                else:
-                    features["_ranking_station_distance"] = np.nan
 
                 features_list.append(features)
             except Exception as e:
@@ -1343,12 +623,13 @@ class XGBoostAfterShockPredictor:
         leakage_columns = [
             col
             for col in all_features_df.columns
-            if "selection_score" in col
+            if "station_distance" in col
+            or "distance_normalized" in col
+            or "selection_score" in col
             or "epicentral_distance" in col
             or "station_lat" in col
             or "station_lon" in col
             or "station_elev" in col
-            or col.startswith("_ranking_")  # Exclude ranking metrics 
         ]
 
         skip_columns.extend(leakage_columns)
@@ -1374,73 +655,52 @@ class XGBoostAfterShockPredictor:
                 "relative_y": group["relative_y"].iloc[0],
                 "relative_z": group["relative_z"].iloc[0],
                 "is_mainshock": group["is_mainshock"].iloc[0],
+                "num_stations": len(group),
             }
 
             # For each feature, calculate various statistics across stations
             for feature in numeric_columns:
                 values = group[feature].values
-                valid_values = values[~np.isnan(values)]
-                
-                if len(valid_values) == 0:
-                    # Handle case with no valid values
-                    event_data[f"{feature}_mean"] = np.nan
-                    event_data[f"{feature}_median"] = np.nan
-                    event_data[f"{feature}_std"] = np.nan
-                    event_data[f"{feature}_min"] = np.nan
-                    event_data[f"{feature}_max"] = np.nan
-                    event_data[f"{feature}_range"] = np.nan
-                    event_data[f"{feature}_q25"] = np.nan
-                    event_data[f"{feature}_q75"] = np.nan
-                    continue
-                    
+
                 # Basic statistics
-                event_data[f"{feature}_mean"] = np.mean(valid_values)
-                event_data[f"{feature}_median"] = np.median(valid_values)
-                # Use NaN for std when there's only one value
-                event_data[f"{feature}_std"] = np.std(valid_values) if len(valid_values) > 1 else np.nan
-                event_data[f"{feature}_min"] = np.min(valid_values)
-                event_data[f"{feature}_max"] = np.max(valid_values)
-                event_data[f"{feature}_range"] = np.ptp(valid_values)
+                event_data[f"{feature}_mean"] = np.mean(values)
+                event_data[f"{feature}_median"] = np.median(values)
+                event_data[f"{feature}_std"] = np.std(values) if len(values) > 1 else 0
+                event_data[f"{feature}_min"] = np.min(values)
+                event_data[f"{feature}_max"] = np.max(values)
+                event_data[f"{feature}_range"] = np.ptp(values)
 
-                # Add direct quantile values for better distribution representation
-                if len(valid_values) >= 4:  # Need enough points for meaningful quartiles
-                    q25, q75 = np.percentile(valid_values, [25, 75])
-                    event_data[f"{feature}_q25"] = q25
-                    event_data[f"{feature}_q75"] = q75
+                # Add robust statistics
+                # IQR (Interquartile Range)
+                if len(values) >= 4:  # Need at least 4 points for meaningful quartiles
+                    q75, q25 = np.percentile(values, [75, 25])
+                    event_data[f"{feature}_iqr"] = q75 - q25
                 else:
-                    # Use NaN for quartiles when there aren't enough points
-                    event_data[f"{feature}_q25"] = np.nan
-                    event_data[f"{feature}_q75"] = np.nan
+                    event_data[f"{feature}_iqr"] = 0
 
-            # Select representative stations using ONLY station_distance
-            if "_ranking_station_distance" in group.columns and not all(np.isnan(group["_ranking_station_distance"])):
-                # Sort by station_distance (ascending) - closest stations first
-                quality_sorted = group.sort_values("_ranking_station_distance")
-            else:
-                # Fallback to original order if station_distance isn't available
-                print(f"Warning: No station_distance available for event {event_id}. Using original order.")
-                quality_sorted = group
-                
-            # Add features from best, second best, and third best stations
-            station_indices = quality_sorted.index.tolist()
-            
-            # Best station (sorted by distance)
+                # MAD (Median Absolute Deviation)
+                if len(values) >= 2:
+                    median = np.median(values)
+                    event_data[f"{feature}_mad"] = np.median(np.abs(values - median))
+                else:
+                    event_data[f"{feature}_mad"] = 0
+
+            # Add features from stations without using selection_score (to avoid leakage)
+            station_indices = group.index.tolist()
+
+            # Instead of using selection_score to find best station, use a simple approach
+            # For example, take the first station's features
             if len(station_indices) > 0:
-                best_station = quality_sorted.iloc[0]
+                first_station = group.iloc[0]
                 for feature in numeric_columns:
-                    event_data[f"best_{feature}"] = best_station[feature]
+                    event_data[f"best_{feature}"] = first_station[feature]
 
-            # Second best station
+            # Add second station features if available, again without selection_score
             if len(station_indices) > 1:
-                second_station = quality_sorted.iloc[1]
+                # Get second station
+                second_station = group.iloc[1]
                 for feature in numeric_columns:
                     event_data[f"second_{feature}"] = second_station[feature]
-
-            # Third best station
-            if len(station_indices) > 2:
-                third_station = quality_sorted.iloc[2]
-                for feature in numeric_columns:
-                    event_data[f"third_{feature}"] = third_station[feature]
 
             aggregated_features.append(event_data)
 
@@ -1464,48 +724,6 @@ class XGBoostAfterShockPredictor:
         X = merged_df.drop(drop_columns, axis=1)
         y = merged_df[["relative_x", "relative_y", "relative_z", "event_id"]]
 
-        # # Remove highly correlated features to reduce redundancy
-        # print("Removing redundant features with high correlation...")
-        
-        # # Get numeric columns
-        # numeric_cols = [col for col in X.columns if pd.api.types.is_numeric_dtype(X[col])]
-        
-        # # Create correlation matrix
-        # corr_matrix = X[numeric_cols].corr().abs()
-        
-        # # Set diagonal and lower triangle to NaN to avoid duplicate pairs
-        # mask = np.triu(np.ones_like(corr_matrix, dtype=bool), k=1)
-        # corr_matrix_masked = corr_matrix.where(mask)
-        
-        # # Find features with correlation > 0.97
-        # high_corr_features = set()
-        # for i, feature in enumerate(corr_matrix_masked.columns):
-        #     # Find features with correlation > 0.97
-        #     correlated_features = corr_matrix_masked.index[corr_matrix_masked[feature] > 0.97].tolist()
-            
-        #     # For each group of correlated features, keep one and mark others for removal
-        #     if correlated_features:
-        #         # Keep the feature with less NaN values
-        #         keep_feature = feature
-        #         nan_count = X[feature].isna().sum()
-                
-        #         for corr_feature in correlated_features:
-        #             corr_nan_count = X[corr_feature].isna().sum()
-        #             if corr_nan_count < nan_count:
-        #                 # This correlated feature has fewer NaNs, keep it instead
-        #                 high_corr_features.add(keep_feature)
-        #                 keep_feature = corr_feature
-        #                 nan_count = corr_nan_count
-        #             else:
-        #                 # Current feature has fewer NaNs, mark this correlated one for removal
-        #                 high_corr_features.add(corr_feature)
-        
-        # # Remove highly correlated features
-        # print(f"Removing {len(high_corr_features)} highly correlated features")
-        # X_filtered = X.drop(columns=list(high_corr_features), errors='ignore')
-        
-        # print(f"Feature dimensionality reduced from {X.shape[1]} to {X_filtered.shape[1]}")
-
         # Validate feature preparation if required
         if self.validation_level != "none":
             X, y = self.validate_features(X, y)
@@ -1521,14 +739,13 @@ class XGBoostAfterShockPredictor:
         else:
             return self.prepare_best_station_dataset()
 
-    def train_xgboost_models(self, X, y, perform_shap=True):
+    def train_lightgbm_models(self, X, y):
         """
-        Train XGBoost models to predict aftershock locations
+        Train LightGBM models to predict aftershock locations
 
         Args:
             X: Feature DataFrame
             y: Target DataFrame with coordinates
-            perform_shap: Whether to perform SHAP analysis (default: True)
 
         Returns:
             X_test, y_test: Test data for evaluation
@@ -1540,7 +757,7 @@ class XGBoostAfterShockPredictor:
                     "Using GroupKFold with event_id as the group to prevent data leakage..."
                 )
                 # Get a single train/test split using GroupKFold
-                gkf = GroupKFold(n_splits=10)
+                gkf = GroupKFold(n_splits=5)
                 groups = y["event_id"]
                 train_idx, test_idx = next(gkf.split(X, y, groups))
 
@@ -1563,7 +780,7 @@ class XGBoostAfterShockPredictor:
                     "Using GroupKFold with event_date as the group to prevent temporal leakage..."
                 )
                 # Get a single train/test split using GroupKFold
-                gkf = GroupKFold(n_splits=10)
+                gkf = GroupKFold(n_splits=5)
                 groups = y["event_date"]
                 train_idx, test_idx = next(gkf.split(X, y, groups))
 
@@ -1621,27 +838,28 @@ class XGBoostAfterShockPredictor:
             X_train_numeric = X_train
             X_test_numeric = X_test
 
-        # Fixed XGBoost parameters (best parameters from previous tuning)
-        xgb_params = {
-            "n_estimators": 321,
-            "learning_rate": 0.04428532496540518,
-            "max_depth": 12,
-            "min_child_weight": 5,
-            "subsample": 0.7600184177542484,
-            "colsample_bytree": 0.9051733564655277,
-            "reg_alpha": 0.00683735048615785,
-            "reg_lambda": 2.556018273438914e-08,
-            "gamma": 4.4393088202742805e-05,
+        # LightGBM parameters (optimized for aftershock prediction)
+        lgbm_params = {
+            "n_estimators": 300,
+            "learning_rate": 0.05,
+            "max_depth": 10,
+            "num_leaves": 100,
+            "min_child_samples": 5,
+            "subsample": 0.8,
+            "colsample_bytree": 0.9,
+            "reg_alpha": 0.01,
+            "reg_lambda": 0.01,
             "random_state": 42,
+            "verbose": -1,  # Less verbose output
         }
 
-        print(f"Training XGBoost model with parameters: {xgb_params}")
+        print(f"Training LightGBM model with parameters: {lgbm_params}")
 
-        # Create and train XGBoost model with fixed parameters
-        base_xgb = XGBRegressor(**xgb_params)
+        # Create and train LightGBM model
+        base_lgbm = LGBMRegressor(**lgbm_params)
 
         # Use MultiOutputRegressor to predict all three coordinates
-        multi_model = MultiOutputRegressor(base_xgb)
+        multi_model = MultiOutputRegressor(base_lgbm)
         multi_model.fit(
             X_train_numeric, y_train_coord[["relative_x", "relative_y", "relative_z"]]
         )
@@ -1673,55 +891,37 @@ class XGBoostAfterShockPredictor:
             print(f"  {coord}: {multi_ml_errors[coord]:.2f} km")
 
         # Store the model
-        self.models = {"multi_output": multi_model, "type": "xgboost"}
-        self.scaler = None  # No scaler used with XGBoost
+        self.models = {"multi_output": multi_model, "type": "lightgbm"}
+        self.scaler = None  # No scaler used with LightGBM
 
         # Extract feature importance
         self.feature_importances = {}
         for i, coord in enumerate(["relative_x", "relative_y", "relative_z"]):
-            xgb_model = multi_model.estimators_[i]
+            lgbm_model = multi_model.estimators_[i]
 
             # Get feature importance
             importance_df = pd.DataFrame(
                 {
                     "feature": X_train_numeric.columns,
-                    "importance": xgb_model.feature_importances_,
+                    "importance": lgbm_model.feature_importances_,
                 }
             ).sort_values("importance", ascending=False)
 
             self.feature_importances[coord] = importance_df
 
             print(f"\nTop features for {coord} prediction:")
-            print(importance_df.head(100))
+            print(importance_df.head(20))
 
             # Save feature importance plot
-            # plt.figure(figsize=(12, 8))
-            # top_features = importance_df.head(100)
-            # sns.barplot(x="importance", y="feature", data=top_features)
-            # plt.title(f"Top 100 Features for {coord} Prediction (XGBoost)")
-            # plt.tight_layout()
-            # plt.savefig(
-            #     f"xgboost_feature_importance_{coord}_{self.approach}_{self.feature_type}.png",
-            #     dpi=300,
-            # )
-            # plt.close()
-
-        # Perform SHAP analysis if requested
-        if perform_shap:
-            try:
-                import shap
-
-                self.shap_results = self.perform_shap_analysis(
-                    X_test_numeric, y_test_coord
-                )
-            except ImportError:
-                print("\nWARNING: SHAP library not found. Skipping SHAP analysis.")
-                print("To install SHAP, run: pip install shap")
-                self.shap_results = None
-            except Exception as e:
-                print(f"\nWARNING: Error during SHAP analysis: {str(e)}")
-                print("Continuing without SHAP analysis.")
-                self.shap_results = None
+            plt.figure(figsize=(12, 8))
+            top_features = importance_df.head(20)
+            sns.barplot(x="importance", y="feature", data=top_features)
+            plt.title(f"Top 20 Features for {coord} Prediction (LightGBM)")
+            plt.tight_layout()
+            plt.savefig(
+                f"lightgbm_feature_importance_{coord}_{self.approach}.png", dpi=300
+            )
+            plt.close()
 
         return X_test_numeric, y_test_coord
 
@@ -1730,7 +930,9 @@ class XGBoostAfterShockPredictor:
         Predict the location of an aftershock from its waveform
         """
         if self.models is None:
-            raise ValueError("Models not trained yet. Call train_xgboost_models first.")
+            raise ValueError(
+                "Models not trained yet. Call train_lightgbm_models first."
+            )
 
         # Extract features from the waveform
         features = self.extract_waveform_features(waveform)
@@ -1865,12 +1067,12 @@ class XGBoostAfterShockPredictor:
         gl.right_labels = False
 
         plt.title(
-            f'XGBoost: True vs Predicted Aftershock Locations ({self.approach.replace("_", " ").title()})'
+            f'LightGBM: True vs Predicted Aftershock Locations ({self.approach.replace("_", " ").title()})'
         )
         plt.legend(loc="lower left")
 
         plt.savefig(
-            f"xgboost_prediction_results_geographic_{self.approach}.png",
+            f"lightgbm_prediction_results_geographic_{self.approach}.png",
             dpi=300,
             bbox_inches="tight",
         )
@@ -1920,12 +1122,12 @@ class XGBoostAfterShockPredictor:
             label=f"Median: {distance_3d_km.median():.2f} km",
         )
         plt.title(
-            f'XGBoost: 3D Location Error Distribution ({self.approach.replace("_", " ").title()})'
+            f'LightGBM: 3D Location Error Distribution ({self.approach.replace("_", " ").title()})'
         )
         plt.xlabel("Error (km)")
         plt.ylabel("Frequency")
         plt.legend()
-        plt.savefig(f"xgboost_prediction_error_histogram_{self.approach}.png", dpi=300)
+        plt.savefig(f"lightgbm_prediction_error_histogram_{self.approach}.png", dpi=300)
 
         # Return coordinate errors
         return (
@@ -1939,12 +1141,9 @@ class XGBoostAfterShockPredictor:
             },
         )
 
-    def run_complete_workflow(self, perform_shap=True):
+    def run_complete_workflow(self):
         """
-        Run the complete analysis workflow with XGBoost
-
-        Args:
-            perform_shap: Whether to perform SHAP analysis
+        Run the complete analysis workflow with LightGBM
 
         Returns:
             Dictionary with results
@@ -1954,11 +1153,10 @@ class XGBoostAfterShockPredictor:
         # Print header
         print("\n" + "=" * 70)
         print(
-            f"XGBOOST AFTERSHOCK ANALYSIS WITH {self.approach.upper()} APPROACH".center(
+            f"LIGHTGBM AFTERSHOCK ANALYSIS WITH {self.approach.upper()} APPROACH".center(
                 70
             )
         )
-        print(f"USING {self.feature_type.upper()} FEATURES".center(70))
         print("=" * 70)
 
         # 1. Find the mainshock
@@ -1992,8 +1190,8 @@ class XGBoostAfterShockPredictor:
         X, y = self.prepare_dataset()
         print(f"Prepared dataset with {len(X)} samples and {X.shape[1]} features")
 
-        # 4. Train XGBoost models (now includes SHAP analysis)
-        X_test, y_test = self.train_xgboost_models(X, y, perform_shap=perform_shap)
+        # 4. Train LightGBM models
+        X_test, y_test = self.train_lightgbm_models(X, y)
 
         # 5. Visualize predictions on a geographic map
         true_abs, pred_abs, errors = self.visualize_predictions_geographic(
@@ -2007,8 +1205,7 @@ class XGBoostAfterShockPredictor:
             f"\nTotal execution time: {execution_time:.1f} seconds ({execution_time/60:.1f} minutes)"
         )
 
-        # Return results dictionary including SHAP results if available
-        results = {
+        return {
             "models": self.models,
             "feature_importances": self.feature_importances,
             "mainshock": self.mainshock,
@@ -2020,12 +1217,6 @@ class XGBoostAfterShockPredictor:
             },
             "validation_results": self.validation_results,
         }
-
-        # Add SHAP results if they exist
-        if hasattr(self, "shap_results") and self.shap_results is not None:
-            results["shap_results"] = self.shap_results
-
-        return results
 
     def validate_data_integrity(self):
         """
@@ -2244,6 +1435,28 @@ class XGBoostAfterShockPredictor:
             print("⚠️ Some conversion errors exceed threshold (100 meters)")
             print("   This could impact location accuracy - proceed with caution")
 
+        # Visualize errors
+        plt.figure(figsize=(10, 6))
+        plt.hist(np.array(distance_errors) * 1000, bins=20)
+        plt.axvline(
+            np.mean(distance_errors) * 1000,
+            color="r",
+            linestyle="--",
+            label=f"Mean: {np.mean(distance_errors)*1000:.2f} meters",
+        )
+        plt.axvline(
+            threshold * 1000,
+            color="g",
+            linestyle="-",
+            label=f"Threshold: {threshold*1000:.0f} meters",
+        )
+        plt.title("Distribution of 3D Round-Trip Conversion Errors")
+        plt.xlabel("Error (meters)")
+        plt.ylabel("Frequency")
+        plt.legend()
+        plt.savefig("lightgbm_coordinate_conversion_errors.png", dpi=300)
+        plt.close()
+
         self.validation_results["coordinate_conversion"] = {
             "passed": passed,
             "max_errors": max_errors,
@@ -2278,7 +1491,6 @@ class XGBoostAfterShockPredictor:
             "station_lat",
             "station_lon",
             "station_elev",
-            "_ranking_station_distance"
         ]
 
         # Find all columns that match any of the forbidden patterns
@@ -2582,227 +1794,42 @@ class XGBoostAfterShockPredictor:
         }
 
 
-def compare_feature_types(
-    data_file,
-    validation_level="full",
-    approach="multi_station",
-    results_dir="xgboost_results",
-):
-    """
-    Compare the performance of different feature types (all, physics, signal) for aftershock prediction
-
-    Args:
-        data_file: Path to data file
-        validation_level: Level of validation to apply
-        approach: Analysis approach to use (best_station or multi_station)
-        results_dir: Directory to save results
-    """
-    # Create results directory if it doesn't exist
-    os.makedirs(results_dir, exist_ok=True)
-
-    print("\n" + "=" * 70)
-    print(f"COMPARING FEATURE TYPES FOR {approach.upper()} APPROACH".center(70))
-    print("=" * 70)
-
-    results = {}
-    error_metrics = {}
-
-    # Run for each feature type
-    feature_types = ["all", "physics", "signal"]
-
-    for feature_type in feature_types:
-        print(f"\nRunning with {feature_type.upper()} features...")
-
-        predictor = XGBoostAfterShockPredictor(
-            data_file=data_file,
-            validation_level=validation_level,
-            approach=approach,
-            feature_type=feature_type,
-        )
-
-        results[feature_type] = predictor.run_complete_workflow()
-
-        # Extract error metrics
-        error_metrics[feature_type] = {
-            "X Error": results[feature_type]["test_results"]["errors"]["lon"].mean(),
-            "Y Error": results[feature_type]["test_results"]["errors"]["lat"].mean(),
-            "Z Error": results[feature_type]["test_results"]["errors"]["depth"].mean(),
-            "3D Mean Error": results[feature_type]["test_results"]["errors"][
-                "3d"
-            ].mean(),
-            "3D Median Error": np.median(
-                results[feature_type]["test_results"]["errors"]["3d"]
-            ),
-        }
-
-    # Create comparison DataFrame
-    comparison_df = pd.DataFrame(error_metrics).T
-
-    # Calculate percentage difference from "all" features baseline
-    baseline = comparison_df.loc["all"]
-    for feature_type in ["physics", "signal"]:
-        comparison_df[f"Diff from All (%)"] = (
-            100 * (comparison_df - baseline) / baseline
-        )
-
-    print("\n" + "=" * 70)
-    print(f"FEATURE TYPE COMPARISON SUMMARY FOR {approach.upper()} APPROACH".center(70))
-    print("=" * 70)
-
-    print("\nError Metrics by Feature Type:")
-    print(
-        comparison_df[
-            ["X Error", "Y Error", "Z Error", "3D Mean Error", "3D Median Error"]
-        ]
-    )
-
-    print("\nPercentage Difference from All Features:")
-    print(comparison_df["Diff from All (%)"])
-
-    # Visualize comparison
-    plt.figure(figsize=(14, 8))
-    bar_width = 0.25
-    index = np.arange(5)  # 5 error metrics
-
-    for i, feature_type in enumerate(feature_types):
-        offset = (i - 1) * bar_width
-        plt.bar(
-            index + offset,
-            comparison_df.loc[
-                feature_type,
-                ["X Error", "Y Error", "Z Error", "3D Mean Error", "3D Median Error"],
-            ],
-            bar_width,
-            label=f"{feature_type.capitalize()} Features",
-        )
-
-    plt.xlabel("Error Metric")
-    plt.ylabel("Error (km)")
-    plt.title(
-        f"XGBoost: Feature Type Comparison ({approach.replace('_', ' ').title()} Approach)"
-    )
-    plt.xticks(index, ["X Error", "Y Error", "Z Error", "3D Mean", "3D Median"])
-    plt.legend()
-    plt.grid(axis="y", linestyle="--", alpha=0.7)
-    plt.savefig(
-        f"{results_dir}/xgboost_feature_type_comparison_{approach}.png", dpi=300
-    )
-    plt.tight_layout()
-
-    # Create 3D error distribution comparison plot
-    plt.figure(figsize=(12, 6))
-    colors = ["blue", "red", "green"]
-
-    for i, feature_type in enumerate(feature_types):
-        sns.histplot(
-            results[feature_type]["test_results"]["errors"]["3d"],
-            kde=True,
-            color=colors[i],
-            alpha=0.4,
-            label=f"{feature_type.capitalize()} Features",
-        )
-        plt.axvline(
-            np.mean(results[feature_type]["test_results"]["errors"]["3d"]),
-            color=colors[i],
-            linestyle="--",
-            label=f"{feature_type.capitalize()} Mean: {np.mean(results[feature_type]['test_results']['errors']['3d']):.2f} km",
-        )
-
-    plt.xlabel("3D Error (km)")
-    plt.ylabel("Frequency")
-    plt.title(
-        f"XGBoost: Error Distribution by Feature Type ({approach.replace('_', ' ').title()} Approach)"
-    )
-    plt.legend()
-    plt.grid(linestyle="--", alpha=0.7)
-    plt.savefig(
-        f"{results_dir}/xgboost_feature_type_error_distribution_{approach}.png", dpi=300
-    )
-    plt.tight_layout()
-
-    # Create feature importance visualization for each feature type
-    for feature_type in feature_types:
-        plt.figure(figsize=(15, 10))
-
-        # Create subplots for X, Y, Z coordinate predictions
-        fig, axes = plt.subplots(3, 1, figsize=(15, 18))
-
-        for i, coord in enumerate(["relative_x", "relative_y", "relative_z"]):
-            # Get top 20 features for this coordinate
-            importance_df = results[feature_type]["feature_importances"][coord].head(20)
-
-            # Plot on the corresponding subplot
-            sns.barplot(x="importance", y="feature", data=importance_df, ax=axes[i])
-            axes[i].set_title(
-                f"Top 20 Features for {coord} ({feature_type.capitalize()} Features)"
-            )
-            axes[i].set_xlabel("Importance")
-            axes[i].set_ylabel("Feature")
-
-        plt.tight_layout()
-        plt.savefig(
-            f"{results_dir}/xgboost_feature_importance_{feature_type}_{approach}.png",
-            dpi=300,
-        )
-        plt.close()
-
-    print(f"\nFeature type comparison results saved to {results_dir}/")
-
-    return comparison_df, results
-
-
 def compare_approaches(
-    data_file,
-    validation_level="full",
-    results_dir="xgboost_results",
-    feature_type="all",
+    data_pickle, validation_level="full", results_dir="lightgbm_results"
 ):
     """
-    Compare best-station and multi-station approaches on the same dataset using XGBoost
-
-    Args:
-        data_file: Path to data file
-        validation_level: Level of validation to apply
-        results_dir: Directory to save results
-        feature_type: Type of features to use ("all", "physics", or "signal")
+    Compare best-station and multi-station approaches on the same dataset using LightGBM
     """
     # Create results directory if it doesn't exist
     os.makedirs(results_dir, exist_ok=True)
 
     print("\n" + "=" * 70)
     print(
-        f"COMPARING BEST-STATION AND MULTI-STATION APPROACHES WITH XGBOOST".center(70)
+        "COMPARING BEST-STATION AND MULTI-STATION APPROACHES WITH LIGHTGBM".center(70)
     )
-    print(f"USING {feature_type.upper()} FEATURES".center(70))
     print("=" * 70)
 
     # 1. Run with best-station approach
-    print("\nRunning best-station approach with XGBoost...")
-    predictor_best = XGBoostAfterShockPredictor(
-        data_file=data_file,
+    print("\nRunning best-station approach with LightGBM...")
+    predictor_best = LightGBMAfterShockPredictor(
+        data_pickle=data_pickle,
         validation_level=validation_level,
         approach="best_station",
-        feature_type=feature_type,
     )
     results_best = predictor_best.run_complete_workflow()
 
     # 2. Run with multi-station approach
-    print("\nRunning multi-station approach with XGBoost...")
-    predictor_multi = XGBoostAfterShockPredictor(
-        data_file=data_file,
+    print("\nRunning multi-station approach with LightGBM...")
+    predictor_multi = LightGBMAfterShockPredictor(
+        data_pickle=data_pickle,
         validation_level=validation_level,
         approach="multi_station",
-        feature_type=feature_type,
     )
     results_multi = predictor_multi.run_complete_workflow()
 
     # 3. Compare the results
     print("\n" + "=" * 70)
-    print(
-        f"XGBOOST APPROACH COMPARISON SUMMARY ({feature_type.upper()} FEATURES)".center(
-            70
-        )
-    )
+    print("LIGHTGBM APPROACH COMPARISON SUMMARY".center(70))
     print("=" * 70)
 
     # Extract error metrics
@@ -2856,7 +1883,7 @@ def compare_approaches(
         * 100
     )
 
-    print(f"\nXGBoost Error Comparison ({feature_type.upper()} FEATURES):")
+    print("\nLightGBM Error Comparison:")
     print(comparison)
 
     # Visualize comparison
@@ -2892,16 +1919,11 @@ def compare_approaches(
 
     plt.xlabel("Error Metric")
     plt.ylabel("Error (km)")
-    plt.title(
-        f"XGBoost: Best-Station vs. Multi-Station Approach ({feature_type.capitalize()} Features)"
-    )
+    plt.title("LightGBM: Best-Station vs. Multi-Station Approach Comparison")
     plt.xticks(index, comparison.index)
     plt.legend()
     plt.grid(axis="y", linestyle="--", alpha=0.7)
-    plt.savefig(
-        f"{results_dir}/xgboost_approach_comparison_{feature_type}_features.png",
-        dpi=300,
-    )
+    plt.savefig(f"{results_dir}/lightgbm_approach_comparison.png", dpi=300)
     plt.tight_layout()
 
     # Analyze error distributions
@@ -2934,14 +1956,10 @@ def compare_approaches(
     )
     plt.xlabel("3D Error (km)")
     plt.ylabel("Frequency")
-    plt.title(
-        f"XGBoost: Error Distribution Comparison ({feature_type.capitalize()} Features)"
-    )
+    plt.title("LightGBM: Error Distribution Comparison")
     plt.legend()
     plt.grid(linestyle="--", alpha=0.7)
-    plt.savefig(
-        f"{results_dir}/xgboost_error_distribution_{feature_type}_features.png", dpi=300
-    )
+    plt.savefig(f"{results_dir}/lightgbm_error_distribution_comparison.png", dpi=300)
     plt.tight_layout()
 
     print(f"\nComparison results saved to {results_dir}/")
@@ -2951,7 +1969,7 @@ def compare_approaches(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train XGBoost models for aftershock location prediction"
+        description="Train LightGBM models for aftershock location prediction"
     )
     parser.add_argument(
         "--data", required=True, help="Path to pickle file with preprocessed data"
@@ -2969,18 +1987,9 @@ if __name__ == "__main__":
         help="Analysis approach (default: compare both)",
     )
     parser.add_argument(
-        "--feature-type",
-        choices=["all", "physics", "signal", "intensity", "compare"],
-        default="all",
-        help="Type of features to use (default: all; 'compare-shap' performs SHAP analysis across feature types)",
-    )
-    parser.add_argument(
         "--results-dir",
-        default="xgboost_results",
-        help="Directory to save results (default: xgboost_results)",
-    )
-    parser.add_argument(
-        "--shap", action="store_true", help="Perform SHAP analysis on trained models"
+        default="lightgbm_results",
+        help="Directory to save results (default: lightgbm_results)",
     )
 
     args = parser.parse_args()
@@ -2988,51 +1997,18 @@ if __name__ == "__main__":
     # Create results directory if it doesn't exist
     os.makedirs(args.results_dir, exist_ok=True)
 
-    # Handle standard feature type comparison without SHAP
-    if args.feature_type == "compare":
-        if args.approach == "compare":
-            print("Cannot compare both approaches and feature types simultaneously.")
-            print("Using multi_station approach for feature type comparison.")
-            comparison_df, results = compare_feature_types(
-                args.data,
-                validation_level=args.validation,
-                approach="multi_station",
-                results_dir=args.results_dir,
-            )
-        else:
-            comparison_df, results = compare_feature_types(
-                args.data,
-                validation_level=args.validation,
-                approach=args.approach,
-                results_dir=args.results_dir,
-            )
-    # Handle approach comparison
-    elif args.approach == "compare":
+    if args.approach == "compare":
+        # Run comparison of both approaches
         comparison, results_best, results_multi = compare_approaches(
-            args.data,
-            validation_level=args.validation,
-            results_dir=args.results_dir,
-            feature_type=args.feature_type,
+            args.data, validation_level=args.validation, results_dir=args.results_dir
         )
-    # Run single configuration
     else:
-        predictor = XGBoostAfterShockPredictor(
-            data_file=args.data,
+        # Run single approach
+        predictor = LightGBMAfterShockPredictor(
+            data_pickle=args.data,
             validation_level=args.validation,
             approach=args.approach,
-            feature_type=args.feature_type,
         )
-        results = predictor.run_complete_workflow(perform_shap=args.shap)
+        results = predictor.run_complete_workflow()
 
-    print(f"All results saved to {args.results_dir}/")
-
-    # predictor = XGBoostAfterShockPredictor(
-    #     data_file=args.data,
-    #     validation_level='none',  # Faster with minimal validation
-    #     approach='best_station'   # Either approach works for this test
-    #     )
-
-    # # Visualize untrained model predictions
-    # untrained_results = predictor.visualize_untrained_predictions()
-
-    # print(f"Results saved")
+    print(f"Results saved")

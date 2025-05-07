@@ -2635,7 +2635,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--data",
-        default="aftershock_data_topN.pkl",
+        default="aftershock_data_topN5.pkl",
         help="Path to pickle file with preprocessed data",
     )
     parser.add_argument(
