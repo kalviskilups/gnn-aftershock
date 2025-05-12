@@ -5,6 +5,72 @@ import pandas as pd
 from tqdm import tqdm
 import seisbench.data as sbd
 import pickle
+from obspy import read_inventory, Trace, Stream, UTCDateTime
+
+# StationXML or SC3-ML both work – choose one
+INV = read_inventory("CX.xml")  # or: read_inventory("query.xml", format="SC3ML")
+
+def to_velocity(wf_np, row, *, mode="full"):
+    """
+    Convert a (3, n) numpy array in SEED counts to ground velocity [m/s].
+
+    mode = "full"  → ObsPy remove_response (amplitude + phase)
+    mode = "scalar"→ divide by InstrumentSensitivity only
+    """
+    net, sta = row['station_network_code'], row['station_code']
+    sr  = row.get('trace_sampling_rate_hz', 100.0)
+    t0  = UTCDateTime(row['trace_start_time'])
+
+    print(f"DEBUG - Net: {net}, Sta: {sta})")
+
+    comps = ["Z", "N", "E"]            # change if your data use other codes
+    ch_codes = [f"HH{c}" for c in comps]   # or HH?, SH? – whatever your CX.xml lists
+
+    if mode == "scalar":
+        # --- quick-and-dirty: divide by InstrumentSensitivity
+        out = np.empty_like(wf_np, dtype=float)
+        for i, cha in enumerate(ch_codes):
+            resp = INV.select(network=net, station=sta, channel=cha)
+            sens = resp[0][0][0].response.instrument_sensitivity.value
+            out[i] = wf_np[i] / sens
+        return out
+
+    else:
+        # --- full deconvolution
+        stream = Stream()
+        for i, cha in enumerate(ch_codes):
+            tr = Trace(wf_np[i].astype("float64"))
+            tr.stats.network   = net
+            tr.stats.station   = sta
+            tr.stats.channel   = cha
+            tr.stats.starttime = t0
+            tr.stats.sampling_rate = sr
+            stream.append(tr)
+
+        # 0.005–0.01 / 40–50 Hz taper keeps numerical noise down at the ends
+        stream.remove_response(inventory=INV, output="VEL",
+                               pre_filt=[0.005, 0.01, 40.0, 50.0])
+        
+        print(f"DEBUG - {net}.{sta} {t0} {sr} Hz")
+
+        # # 1. overlay Peterson global noise curves (quick visual test)
+        # from obspy.signal import PPSD
+        # tr = stream[0]                     # any velocity Trace after remove_response
+        # ppsd = PPSD(tr.stats, metadata=INV)
+        # ppsd.add(stream)
+        # ppsd.plot(show_noise_models=True)  # trace should wander between NLNM and NHNM
+
+        # # 2. check that raw / response ≈ corrected in the frequency domain
+        # import numpy as np
+        # f = np.logspace(-2, np.log10(tr.stats.sampling_rate/2), 300)
+        # raw_amp  = np.abs(np.fft.rfft(tr_copy.data, n=8192))[:len(f)]      # rough PSD
+        # _, h = INV.get_response(tr.id, tr.stats.starttime).get_evalresp_response_t(f)
+        # corr_amp = np.abs(np.fft.rfft(tr.data, n=8192))[:len(f)]
+        # np.testing.assert_allclose(raw_amp / np.abs(h), corr_amp, rtol=0.1)
+
+
+        # back to a (3, n) array
+        return np.vstack([tr.data for tr in stream])
 
 def load_aftershock_data_with_CX_waveforms(top_n=15, min_stations=5):
     """
@@ -125,10 +191,24 @@ def load_aftershock_data_with_CX_waveforms(top_n=15, min_stations=5):
             idx = row.name  # row index in metadata
             station_key = f"{row['station_network_code']}.{row['station_code']}"
 
-            # get the waveform
-            waveform = iquique.get_waveforms(int(idx))
-            if waveform.shape[0] != 3:
+            # get the waveform in counts
+            wf_counts = iquique.get_waveforms(int(idx))
+            if wf_counts.shape[0] != 3:
                 continue  # skip if components missing
+                
+            # convert from counts to velocity in m/s
+            waveform = to_velocity(wf_counts, row, mode="full")  # Use "full" for detailed analysis
+
+            # 1. confirm units & processing entry
+            for comp, w in zip("ZNE", waveform):
+                print(f"{row.station_code} {comp}:  mean={w.mean():+.2e}  max={w.max():.2e}")
+
+            # # 2. quick spectrum slope check (–20 dB/dec outside 0.01–40 Hz is normal)
+            # if np.random.rand() < 0.01:           # plot only 1 % of traces
+            #     from matplotlib import pyplot as plt, mlab
+            #     Pxx, f = mlab.psd(w, Fs=row.trace_sampling_rate_hz, NFFT=4096)
+            #     plt.loglog(f, np.sqrt(Pxx)); plt.axvline(0.01); plt.axvline(40); plt.show()
+
 
             event_stations[station_key] = {
                 'metadata': row.to_dict(),
@@ -152,7 +232,6 @@ def load_aftershock_data_with_CX_waveforms(top_n=15, min_stations=5):
         pickle.dump(data_dict, f)
     print(f"Saved {len(data_dict)} events with CX stations (min {min_stations}, max {top_n} stations each)")
     return data_dict, iquique
-
 
 
 if __name__ == "__main__":
